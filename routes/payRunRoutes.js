@@ -24,7 +24,11 @@ router.patch(
   authorizeRoles('admin', 'hr'),     // only payroll-capable roles
   payRunCtrl.updateCurrentRunLine    // delegate to controller
 );
-router.patch('/current/status', authenticateToken, payRunCtrl.updateStatus);
+router.patch(
+  '/current/status', 
+  authenticateToken, 
+  authorizeRoles('admin', 'hr'),
+  payRunCtrl.updateStatus);
 
 
 module.exports = router;
