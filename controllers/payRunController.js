@@ -134,3 +134,35 @@ exports.postCurrent = async (req, res) => {
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
+
+/**
+ * PATCH /api/pay-runs/current/status
+ * Body: { status: "Draft" | "Approved" | "Posted" }
+ */
+exports.updateStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+    const userId = req.user?.id;
+
+    if (!status) {
+      return res.status(400).json({ message: "Missing status field" });
+    }
+
+    const validStatuses = ["Draft", "Approved", "Posted"];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: "Invalid status value" });
+    }
+
+    const result = await payRunService.updateCurrentRunStatus({ status, userId });
+
+    if (!result) {
+      return res.status(404).json({ message: "No current run found" });
+    }
+
+    return res.json({ ok: true, message: "Status updated", status });
+  } catch (err) {
+    console.error("[payRun] updateStatus error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
+
