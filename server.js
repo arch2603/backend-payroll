@@ -39,16 +39,17 @@ app.use(cors(corsOptions))
 // app.options("*", cors(corsOptions));
 app.use(express.json());
 
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 // mount routes
 app.use('/auth', authRoutes); // /auth/login, /auth/register (admin)
 app.use('/api/users', userRoutes); // /api/users GET/POST (admin only)
 app.use('/api/dashboard', dashboardRoutes);       // counts, audit
 app.use('/api/employees', employeeRoutes);
 app.use('/api', historyRoutes);
-
 app.use('/api/pay-runs', payRunRoutes);
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+
 
 app.use((err, req, res, next) => {
   console.error('UNCAUGHT:', err);

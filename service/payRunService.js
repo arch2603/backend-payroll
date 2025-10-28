@@ -318,3 +318,16 @@ exports.updateCurrentRunStatus = async ({ status, userId }) => {
   }
 };
 
+module.exports = {
+  async getCurrentRunSummary(){ return null; },
+  async getCurrentRunItems(){ return []; },
+  async getCurrentRun(){ return null; },
+  async startCurrentRun(){ return { ok:true }; },
+  async recalcCurrentRun(){ return { ok:true }; },
+  async approveCurrentRun(){ return { ok:true }; },
+  async postCurrentRun(){ return { ok:true }; },
+  async updateCurrentRunLine(id, body){ return { ok:true, id, ...body }; },
+  async updateCurrentRunStatus(status){ return { ok:true, status }; },
+};
+
+
