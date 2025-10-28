@@ -10,6 +10,7 @@ console.log('[payRunRoutes] typeof payRunCtrl =', typeof payRunCtrl);
 })
 
 router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
+router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
 router.get('/current/items', authenticateToken, payRunCtrl.getCurrentItems);
 router.get('/current', authenticateToken, payRunCtrl.getCurrent);
 
@@ -30,5 +31,6 @@ router.patch(
   authorizeRoles('admin', 'hr'),
   payRunCtrl.updateStatus);
 
+  router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
 
 module.exports = router;
