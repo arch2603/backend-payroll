@@ -293,8 +293,6 @@ exports.getCurrentRunView = async () => {
   }
 };
 
-const pool = require('../db'); // assuming you already export your pg Pool instance
-
 exports.updateCurrentRunStatus = async ({ status, userId }) => {
   try {
     const sql = `
