@@ -292,3 +292,31 @@ exports.getCurrentRunView = async () => {
     client.release();
   }
 };
+
+const pool = require('../db'); // assuming you already export your pg Pool instance
+
+exports.updateCurrentRunStatus = async ({ status, userId }) => {
+  try {
+    const sql = `
+      UPDATE pay_runs
+      SET status = $1,
+          approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
+          approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END,
+          created_at = created_at  -- no change
+      WHERE id = (
+        SELECT id FROM pay_runs
+        WHERE status != 'Posted'
+        ORDER BY created_at DESC
+        LIMIT 1
+      )
+      RETURNING *;
+    `;
+
+    const { rows } = await pool.query(sql, [status, userId]);
+    return rows[0] || null;
+  } catch (err) {
+    console.error("[payRunService] updateCurrentRunStatus error:", err);
+    throw err;
+  }
+};
+
