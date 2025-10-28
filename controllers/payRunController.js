@@ -81,3 +81,56 @@ exports.getCurrentItems = async (req, res) => {
     return res.status(500).json({ message: 'Internal server error', detail: String(err.message || err) });
   }
 };
+
+exports.getCurrent = async (req, res) => {
+  try {
+    const cur = await payRunService.getCurrentRunView();
+    if (!cur) return res.json({ status: 'None' });
+    return res.json(cur);
+  } catch (err) {
+    console.error('[payRun] getCurrent error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.startCurrent = async (req, res) => {
+  try {
+    const out = await payRunService.startCurrentRun({ userId: req.user?.id });
+    return res.json(out);
+  } catch (err) {
+    console.error('[payRun] startCurrent error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.recalculateCurrent = async (req, res) => {
+  try {
+    const out = await payRunService.recalculateCurrentRun();
+    return res.json(out);
+  } catch (err) {
+    console.error('[payRun] recalcCurrent error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.approveCurrent = async (req, res) => {
+  try {
+    const out = await payRunService.approveCurrentRun({ userId: req.user?.id });
+    if (out?.conflict) return res.status(409).json(out);
+    return res.json(out);
+  } catch (err) {
+    console.error('[payRun] approveCurrent error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.postCurrent = async (req, res) => {
+  try {
+    const out = await payRunService.postCurrentRun({ userId: req.user?.id });
+    if (out?.conflict) return res.status(409).json(out);
+    return res.json(out);
+  } catch (err) {
+    console.error('[payRun] postCurrent error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
