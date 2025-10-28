@@ -223,3 +223,72 @@ exports.getCurrentRunItems = async ({ search = '', limit = 25, offset = 0 }) => 
     client.release();
   }
 };
+
+async function getActiveRunId(client) {
+  // If you have v_current_run, use it:
+  const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
+  if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
+
+  // Fallback by date + status (adjust table/cols to your schema)
+  const q = await client.query(`
+    SELECT r.id AS pay_run_id
+    FROM pay_runs r
+    JOIN pay_periods pp ON pp.id = r.period_id
+    WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+      AND r.status IN ('Draft','Approved','Posted')
+    ORDER BY r.updated_at DESC NULLS LAST
+    LIMIT 1
+  `);
+  return q.rows[0]?.pay_run_id || null;
+}
+
+exports.getCurrentRunView = async () => {
+  const client = await pool.connect();
+  try {
+    const runId = await getActiveRunId(client);
+    if (!runId) return null;
+
+    // status + period
+    const meta = await client.query(`
+      SELECT r.status,
+             pp.period_start AS start,
+             pp.period_end   AS "end"
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE r.id = $1
+    `, [runId]);
+
+    const { status, start, end } = meta.rows[0];
+
+    // items: nested employee + four money fields
+    const { rows } = await client.query(`
+      SELECT 
+        e.employee_id                                         AS emp_id,
+        (e.first_name || ' ' || e.last_name)                  AS emp_name,
+        COALESCE(l.gross,0)::numeric(12,2)                    AS gross,
+        COALESCE(l.tax,0)::numeric(12,2)                      AS tax,
+        COALESCE(l.post_tax_deductions,0)::numeric(12,2)      AS deductions,
+        COALESCE(l.net,0)::numeric(12,2)                      AS net
+      FROM pay_run_items l
+      JOIN employee e ON e.employee_id = l.employee_id
+      WHERE l.pay_run_id = $1
+      ORDER BY e.last_name, e.first_name, l.id
+    `, [runId]);
+
+    const items = rows.map(r => ({
+      employee: { id: Number(r.emp_id), name: r.emp_name },
+      gross: Number(r.gross),
+      tax: Number(r.tax),
+      deductions: Number(r.deductions),
+      net: Number(r.net),
+    }));
+
+    return {
+      status,                           // "Draft" | "Approved" | "Posted"
+      period: { start, end },           // strings; ISO from PG is fine
+      items
+    };
+  } finally {
+    client.release();
+  }
+};
