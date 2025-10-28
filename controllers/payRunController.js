@@ -1,4 +1,3 @@
-const e = require('express');
 const { z } = require('zod');
 let payRunService;
 try {
@@ -51,11 +50,13 @@ exports.getCurrentSummary = async (req, res) => {
 
 exports.getCurrentItems = async (req, res) => {
   try {
-    const items = await payRunService?.getCurrentRunItems?.() ?? null;
-    if (!items) {
-      return res.json({ status: 'None', items: [] });
+    const result = await payRunService?.getCurrentRunItems?.() ?? null;
+    if(!result) {
+        return res.json({status: 'None', items: []});
     }
-    return res.json({ status: 'Draft', items: Array.isArray(items) ? items : [] });
+    
+    const list = Array.isArray(result) ? result : Array.isArray(result{ status: 'Draft', items: list }.items) ? result.items : [];
+    return res.json({ status: 'Draft', items: list });
   } catch (err) {
     console.error('[payRun] getCurrentItems error:', err);
     return res.status(500).json({ message: 'Internal server error' });
@@ -69,8 +70,8 @@ exports.getCurrent = async (req, res) => {
     return res.json({
       status: data.status ?? 'Draft',
       period: data.period ?? null,
-      totals: data.totals ?? { employees: 0, gross: 0, tax: 0, deductions: 0, net: 0 },
-      items: Array.isArray(data.items) ? data.items : []
+      totals: ensureTotals(data.totals),
+      items: ensureArray(data.items)
     });
   } catch (err) {
     console.error('[payRun] getCurrent error:', err);
@@ -134,7 +135,7 @@ exports.updateCurrentRunLine = async (req, res) => {
       console.warn('[payRun] updateCurrentRunLine not implemented; returning ok:true');
       return res.json({ ok: true });
     }
-    const result = await payRunService?.updateCurrentRunLine?.(Number(line_id), body)
+    const result = await payRunService?.updateCurrentRunLine?.(Number(line_id), body, req.user?.user_id)
     return res.json(result ?? { ok: true });
   } catch (err) {
     console.error('[payRun] updateCurrentRunLine error:', err);
@@ -142,7 +143,6 @@ exports.updateCurrentRunLine = async (req, res) => {
   }
 };
 
-// PATCH /api/pay-runs/current/status { status }
 exports.updateStatus = async (req, res) => {
   try {
     const { status } = req.body; // expect 'Draft'|'Approved'|'Posted'
@@ -151,7 +151,7 @@ exports.updateStatus = async (req, res) => {
       console.warn('[payRun] updateCurrentRunStatus not implemented; echoing');
       return res.json({ ok: true, status });
     }
-    const result = await payRunService?.updateCurrentRunStatus?.(status);
+    const result = await payRunService?.updateCurrentRunStatus?.(status, req.user?.user_id);
     return res.json(result ?? { ok: true, status });
   } catch (err) {
     console.error('[payRun] updateStatus error:', err);
