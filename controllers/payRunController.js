@@ -50,13 +50,18 @@ exports.getCurrentSummary = async (req, res) => {
 
 exports.getCurrentItems = async (req, res) => {
   try {
-    const result = await payRunService?.getCurrentRunItems?.() ?? null;
+    const { search = '', limit = 25, offset = 0 } = req.query;
+    const result = await payRunService?.getCurrentRunItems?.({
+        search: String(search),
+        limit: Number(limit) || 25,
+        offset: Number(offset) || 0
+    });
+
     if(!result) {
         return res.json({status: 'None', items: []});
     }
     
-    const list = Array.isArray(result) ? result : Array.isArray(result{ status: 'Draft', items: list }.items) ? result.items : [];
-    return res.json({ status: 'Draft', items: list });
+    return res.json({ status: 'Draft', ...result });
   } catch (err) {
     console.error('[payRun] getCurrentItems error:', err);
     return res.status(500).json({ message: 'Internal server error' });

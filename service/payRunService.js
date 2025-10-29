@@ -1,42 +1,43 @@
+// service/payRunService.js
 const pool = require('../db');
 
-// helper to recalc a single line; replace with your real rules or a DB function
+// ---- helper: recalc a single line
 async function recalcLine(client, lineId) {
-  // Example: gross = hours * rate + allowance - preTaxDeductions
   const { rows: lineRows } = await client.query(`
     SELECT 
-      id, employee_id, 
-      COALESCE(hours,0)    AS hours,
-      COALESCE(rate,0)     AS rate,
-      COALESCE(allowance,0) AS allowance,
-      COALESCE(tax,0)      AS tax,
-      COALESCE("super",0)  AS "super",
-      COALESCE(post_tax_deductions,0) AS post_tax_deductions
+      id, employee_id, pay_run_id,
+      COALESCE(hours,0)                  AS hours,
+      COALESCE(rate,0)                   AS rate,
+      COALESCE(allowance,0)              AS allowance,
+      COALESCE(tax,0)                    AS tax,
+      COALESCE("super",0)                AS "super",
+      COALESCE(post_tax_deductions,0)    AS post_tax_deductions
     FROM pay_run_items
-    WHERE id = $1`, 
-    [lineId]);
+    WHERE id = $1
+  `, [lineId]);
 
   if (lineRows.length === 0) return null;
 
   const L = lineRows[0];
   const gross = Number(L.hours) * Number(L.rate) + Number(L.allowance || 0);
-  // You may compute tax/super here or call a DB function:
-  // SELECT * FROM compute_payroll_components($1);
-  const tax = L.tax ?? 0;
-  const sup = L.super ?? 0;
-  const net = gross - tax - Number(L.post_tax_deductions || 0) - sup; // adjust to your logic
+  // TODO: replace with your real tax/super calc or DB function
+  const tax = Number(L.tax || 0);
+  const sup = Number(L.super || 0);
+  const net = gross - tax - Number(L.post_tax_deductions || 0) - sup;
 
   await client.query(`
     UPDATE pay_run_items
-       SET gross = $2, tax = $3, super = $4, net = $5, updated_at = NOW()
+       SET gross = $2, tax = $3, "super" = $4, net = $5, updated_at = NOW()
      WHERE id = $1
   `, [lineId, gross, tax, sup, net]);
 
   const { rows: updated } = await client.query(`
-    SELECT id as line_id, employee_id, hours, allowance, rate, gross, tax, "super", post_tax_deductions as deductions, net, status
+    SELECT id as line_id, employee_id, pay_run_id,
+           hours, allowance, rate, gross, tax, "super",
+           post_tax_deductions as deductions, net, status
     FROM pay_run_items 
-    WHERE id = $1`, 
-    [lineId]);
+    WHERE id = $1
+  `, [lineId]);
 
   return updated[0];
 }
@@ -53,7 +54,7 @@ async function recomputeRunSummary(client, runId) {
   `, [runId]);
 
   const s = rows[0];
-  
+
   await client.query(`
     UPDATE pay_runs
        SET totals_employees = $2,
@@ -64,104 +65,137 @@ async function recomputeRunSummary(client, runId) {
      WHERE id = $1
   `, [runId, s.employees, s.gross, s.net, s.warnings]);
 
-  return { totals: { employees: s.employees, gross: s.gross, net: s.net }, warnings: s.warnings };
+  return {
+    totals: {
+      employees: Number(s.employees || 0),
+      gross: Number(s.gross || 0),
+      net: Number(s.net || 0)
+    },
+    warnings: Number(s.warnings || 0)
+  };
 }
 
-exports.updateCurrentRunLine = async ({ lineId, patch, userId }) => {
+async function getActiveRunId(client) {
+  // Prefer your view if present
+  const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
+  if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
+
+  // Fallback by date + status (adjust statuses to your enum)
+  const q = await client.query(`
+    SELECT r.id AS pay_run_id
+    FROM pay_runs r
+    JOIN pay_periods pp ON pp.id = r.period_id
+    WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+      AND r.status IN ('Draft','Approved','Posted')
+    ORDER BY r.updated_at DESC NULLS LAST
+    LIMIT 1
+  `);
+  return q.rows[0]?.pay_run_id || null;
+}
+
+// -------- Controller expects: { status, period: {start,end}, totals, items? }
+async function getCurrentRunSummary() {
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
-    // ensure the line belongs to the "current" run
-    const { rows: chk } = await client.query(`
-      SELECT l.id, l.run_id, r.status
-      FROM pay_run_items l
-      JOIN pay_runs r ON r.id = l.run_id
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE l.id = $1 
-      AND CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
-      AND r.status IN ('Draft', 'OPEN')
-      FOR UPDATE`,
-      [lineId]);
-    if (chk.length === 0) {
-      await client.query('ROLLBACK');
-      return null;
-    }
-
-    const runId = chk[0].run_id;
-
-    // build dynamic set clause
-    const sets = [];
-    const vals = [lineId];
-    if (patch.hours !== undefined) { vals.push(patch.hours); sets.push(`hours = $${vals.length}`); }
-    if (patch.allowance !== undefined) { vals.push(patch.allowance); sets.push(`allowance = $${vals.length}`); }
-    if (patch.note !== undefined) { vals.push(patch.note); sets.push(`note = $${vals.length}`); }
-
-    if (sets.length) {
-      await client.query(`UPDATE pay_run_lines SET ${sets.join(', ')}, updated_by=$${vals.length + 1}, updated_at=NOW() WHERE id = $1`,
-        [...vals, userId || null]);
-    }
-
-    // recalc this line
-    const updatedLine = await recalcLine(client, lineId);
-
-    // refresh run summary
-    const summary = await recomputeRunSummary(client, runId);
-
-    await client.query('COMMIT');
-    return { line: updatedLine, summary };
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
-};
-
-exports.getCurrentRunSummary = async () => {
-  const client = await pool.connect();
-  try {
+    // 1) Try the view
     const { rows } = await client.query(`
-      SELECT id, period_start, period_end, status,
-             totals_employees, totals_gross, totals_net, warnings
+      SELECT 
+      id, 
+      period_start, 
+      period_end, 
+      status,
+      totals_employees, 
+      totals_gross,
+      totals_tax,
+      totals_deductions, 
+      totals_net, 
+      updated_at
       FROM current_pay_run_summary
       ORDER BY updated_at DESC
       LIMIT 1
     `);
-    if (rows.length === 0) return null;
-    const r = rows[0];
+    if (rows.length > 0) {
+      const r = rows[0];
+      return {
+        status: r.status,
+        period: { start: r.period_start, end: r.period_end },
+        totals: {
+          employees: Number(r.totals_employees || 0),
+          gross: Number(r.totals_gross ?? 0),
+          tax: Number(r.totals_tax || 0),
+          deductions: Number(r.totals_deductions || 0),
+          net: Number(r.totals_net || 0),
+        },
+        items: []
+      };
+    }
+
+    // 2) Fallback: compute from base tables for today's period
+    const meta = await client.query(`
+      SELECT r.id, r.status, pp.period_start, pp.period_end
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+        AND r.status IN ('Draft','Approved','Posted')
+      ORDER BY r.updated_at DESC NULLS LAST
+      LIMIT 1
+    `);
+    if (meta.rows.length === 0) return null;
+
+    const run = meta.rows[0];
+
+    const sums = await client.query(`
+      SELECT
+        COUNT(DISTINCT employee_id)::int             AS employees,
+        COALESCE(SUM(gross),             0)::numeric AS gross,
+        COALESCE(SUM(tax),               0)::numeric AS tax,
+        COALESCE(SUM(deductions_total),  0)::numeric AS deductions,
+        COALESCE(SUM(net),               0)::numeric AS net
+      FROM pay_run_items
+      WHERE pay_run_id = $1
+    `, [run.id]);
+
+    const s = sums.rows[0];
+
     return {
-      payRunId: r.id,
-      periodStart: r.period_start,
-      periodEnd: r.period_end,
-      status: r.status,
+      status: run.status,
+      period: { start: run.period_start, end: run.period_end },
       totals: {
-        employees: r.totals_employees ?? 0,
-        gross: Number(r.totals_gross ?? 0),
-        net: Number(r.totals_net ?? 0)
+        employees: Number(s.employees ?? 0),
+        gross:     Number(s.gross     ?? 0),
+        tax:       Number(s.tax       ?? 0),
+        deductions:Number(s.deductions?? 0),
+        net:       Number(s.net       ?? 0)
       },
-      warnings: r.warnings ?? 0
+      items: []
     };
   } finally {
     client.release();
   }
-};
+}
 
-// Return paged items for the current run (search by employee name)
-exports.getCurrentRunItems = async ({ search = '', limit = 25, offset = 0 }) => {
+
+// -------- Controller expects an ARRAY (not {items,paging})
+async function getCurrentRunItems ({ search = '', limit = 25, offset = 0 } = {}) {
   const client = await pool.connect();
   try {
-    
-    const { rows: cur } = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
-    const runId = cur[0]?.pay_run_id;
+    // find active run by date/status
+    const { rows: rid } = await client.query(`
+      SELECT r.id AS pay_run_id
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+        AND r.status IN ('Draft','Approved','Posted')
+      ORDER BY r.updated_at DESC, r.created_at DESC
+      LIMIT 1
+    `);
+    const runId = rid[0]?.pay_run_id;
+    if (!runId) return { items: [], paging: { search, limit, offset, total: 0 } };
 
-    if (!runId) {
-      return { items: [], paging: { search, limit, offset, total: 0 } };
-    }
-
-    // COUNT (use consistent table/aliases and FK column)
+    // count
     const { rows: crows } = await client.query(
-     `SELECT COUNT(*)::int AS total
+      `
+      SELECT COUNT(*)::int AS total
       FROM pay_run_items l
       JOIN employee e ON e.employee_id = l.employee_id
       WHERE l.pay_run_id = $1
@@ -175,18 +209,19 @@ exports.getCurrentRunItems = async ({ search = '', limit = 25, offset = 0 }) => 
     );
     const total = crows[0].total;
 
-    // DATA (same aliases and FK)
+    // data
     const { rows } = await client.query(
       `
       SELECT
-        l.id AS line_id,
-        e.employee_id AS employee_id,
-        (e.first_name || ' ' || e.last_name) AS employee_name,
-        l.rate  AS hourly_rate,
+        l.id                                 AS line_id,
+        e.employee_id                         AS employee_id,
+        (e.first_name || ' ' || e.last_name)  AS employee_name,
+        l.rate                                 AS hourly_rate,
         l.hours,
         l.allowance,
         l.gross,
         l.tax,
+        l.deductions_total,
         l.super,
         l.net,
         l.status
@@ -213,6 +248,7 @@ exports.getCurrentRunItems = async ({ search = '', limit = 25, offset = 0 }) => 
       allowance: Number(r.allowance ?? 0),
       gross: Number(r.gross ?? 0),
       tax: Number(r.tax ?? 0),
+      deductions: Number(r.deductions_total ?? 0),
       super: Number(r.super ?? 0),
       net: Number(r.net ?? 0),
       status: r.status
@@ -224,31 +260,12 @@ exports.getCurrentRunItems = async ({ search = '', limit = 25, offset = 0 }) => 
   }
 };
 
-async function getActiveRunId(client) {
-  // If you have v_current_run, use it:
-  const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
-  if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
-
-  // Fallback by date + status (adjust table/cols to your schema)
-  const q = await client.query(`
-    SELECT r.id AS pay_run_id
-    FROM pay_runs r
-    JOIN pay_periods pp ON pp.id = r.period_id
-    WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
-      AND r.status IN ('Draft','Approved','Posted')
-    ORDER BY r.updated_at DESC NULLS LAST
-    LIMIT 1
-  `);
-  return q.rows[0]?.pay_run_id || null;
-}
-
-exports.getCurrentRunView = async () => {
+async function getCurrentRun() {
   const client = await pool.connect();
   try {
     const runId = await getActiveRunId(client);
     if (!runId) return null;
 
-    // status + period
     const meta = await client.query(`
       SELECT r.status,
              pp.period_start AS start,
@@ -260,8 +277,7 @@ exports.getCurrentRunView = async () => {
 
     const { status, start, end } = meta.rows[0];
 
-    // items: nested employee + four money fields
-    const { rows } = await client.query(`
+    const itemsRows = await client.query(`
       SELECT 
         e.employee_id                                         AS emp_id,
         (e.first_name || ' ' || e.last_name)                  AS emp_name,
@@ -275,7 +291,7 @@ exports.getCurrentRunView = async () => {
       ORDER BY e.last_name, e.first_name, l.id
     `, [runId]);
 
-    const items = rows.map(r => ({
+    const items = itemsRows.rows.map(r => ({
       employee: { id: Number(r.emp_id), name: r.emp_name },
       gross: Number(r.gross),
       tax: Number(r.tax),
@@ -283,51 +299,92 @@ exports.getCurrentRunView = async () => {
       net: Number(r.net),
     }));
 
-    return {
-      status,                           // "Draft" | "Approved" | "Posted"
-      period: { start, end },           // strings; ISO from PG is fine
-      items
-    };
+    return { status, period: { start, end }, items };
   } finally {
     client.release();
   }
-};
+}
 
-exports.updateCurrentRunStatus = async ({ status, userId }) => {
+// Align with controller: (lineId, patch, userId)
+async function updateCurrentRunLine(lineId, patch, userId) {
+  const client = await pool.connect();
   try {
-    const sql = `
-      UPDATE pay_runs
-      SET status = $1,
-          approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
-          approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END,
-          created_at = created_at  -- no change
-      WHERE id = (
-        SELECT id FROM pay_runs
-        WHERE status != 'Posted'
-        ORDER BY created_at DESC
-        LIMIT 1
-      )
-      RETURNING *;
-    `;
+    await client.query('BEGIN');
 
-    const { rows } = await pool.query(sql, [status, userId]);
-    return rows[0] || null;
-  } catch (err) {
-    console.error("[payRunService] updateCurrentRunStatus error:", err);
-    throw err;
+    // ensure the line belongs to the *current* run
+    const { rows: chk } = await client.query(`
+      SELECT l.id, l.pay_run_id, r.status
+      FROM pay_run_items l
+      JOIN pay_runs r     ON r.id = l.pay_run_id
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE l.id = $1 
+        AND CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+        AND r.status IN ('Draft','Approved','Posted')
+      FOR UPDATE
+    `, [lineId]);
+
+    if (chk.length === 0) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const runId = chk[0].pay_run_id;
+
+    const sets = [];
+    const vals = [lineId];
+    if (patch.hours !== undefined)     { vals.push(patch.hours);     sets.push(`hours     = $${vals.length}`); }
+    if (patch.allowance !== undefined) { vals.push(patch.allowance); sets.push(`allowance = $${vals.length}`); }
+    if (patch.note !== undefined)      { vals.push(patch.note);      sets.push(`note      = $${vals.length}`); }
+
+    if (sets.length) {
+      vals.push(userId || null);
+      await client.query(
+        `UPDATE pay_run_items SET ${sets.join(', ')}, updated_by=$${vals.length}, updated_at=NOW() WHERE id = $1`,
+        vals
+      );
+    }
+
+    const updatedLine = await recalcLine(client, lineId);
+    const summary     = await recomputeRunSummary(client, runId);
+
+    await client.query('COMMIT');
+    return { line: updatedLine, summary };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
-};
+}
 
+// Align with controller: (status, userId)
+async function updateCurrentRunStatus(status, userId) {
+  const sql = `
+    UPDATE pay_runs
+    SET status = $1,
+        approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
+        approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END
+    WHERE id = (
+      SELECT id FROM pay_runs
+      WHERE status != 'Posted'
+      ORDER BY created_at DESC
+      LIMIT 1
+    )
+    RETURNING *;
+  `;
+  const { rows } = await pool.query(sql, [status, userId || null]);
+  return rows[0] || null;
+}
+
+// ---- final exports (no stub overwrite)
 module.exports = {
-  async getCurrentRunSummary(){ return null; },
-  async getCurrentRunItems(){ return []; },
-  async getCurrentRun(){ return null; },
-  async startCurrentRun(){ return { ok:true }; },
-  async recalcCurrentRun(){ return { ok:true }; },
-  async approveCurrentRun(){ return { ok:true }; },
-  async postCurrentRun(){ return { ok:true }; },
-  async updateCurrentRunLine(id, body){ return { ok:true, id, ...body }; },
-  async updateCurrentRunStatus(status){ return { ok:true, status }; },
+  getCurrentRunSummary,
+  getCurrentRunItems,   // returns ARRAY
+  getCurrentRun,
+  startCurrentRun: async () => ({ ok: true }), // fill in when ready
+  recalcCurrentRun: async () => ({ ok: true }),
+  approveCurrentRun: async () => ({ ok: true }),
+  postCurrentRun: async () => ({ ok: true }),
+  updateCurrentRunLine,      // (lineId, patch, userId)
+  updateCurrentRunStatus     // (status, userId)
 };
-
-
