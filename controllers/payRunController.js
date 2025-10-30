@@ -163,5 +163,21 @@ exports.updateStatus = async (req, res) => {
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
+exports.startForPeriod = async (req, res) => {
+  const { period_id } = req.body;
+  const userId = req.user?.user_id || null;
+
+  if (!period_id) {
+    return res.status(400).json({ message: "period_id is required" });
+  }
+
+  try {
+    const run = await payRunService.startForPeriod(period_id, userId);
+    return res.json(run);
+  } catch (err) {
+    console.error("[payRun] startForPeriod error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
 
 

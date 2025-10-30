@@ -18,6 +18,12 @@ router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), p
 router.post('/current/recalculate', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.recalculateCurrent);
 router.post('/current/approve', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.approveCurrent);
 router.post('/current/post', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.postCurrent);
+router.post(
+  "/start",
+  authenticateToken,
+  authorizeRoles("admin","hr"),
+  payRunCtrl.startForPeriod
+);
 
 router.patch(
   '/current/items/:line_id',
@@ -31,6 +37,6 @@ router.patch(
   authorizeRoles('admin', 'hr'),
   payRunCtrl.updateStatus);
 
-  router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
+router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
 
 module.exports = router;

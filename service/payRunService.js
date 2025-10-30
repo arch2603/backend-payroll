@@ -376,6 +376,34 @@ async function updateCurrentRunStatus(status, userId) {
   return rows[0] || null;
 }
 
+async function startForPeriod(periodId, userId = null) {
+  // make sure period exists
+  const { rows: p } = await db.query(
+    `SELECT id FROM pay_periods WHERE id = $1`,
+    [periodId]
+  );
+  if (!p.length) throw new Error("Period not found");
+
+  // check if a run already exists for this period
+  const { rows: existing } = await db.query(
+    `SELECT id FROM pay_runs WHERE period_id = $1 LIMIT 1`,
+    [periodId]
+  );
+  if (existing.length) {
+    // either return existing, or throw
+    return existing[0];
+  }
+
+  const { rows } = await db.query(
+    `INSERT INTO pay_runs (period_id, status, created_by, created_at)
+     VALUES ($1, 'Draft', $2, now())
+     RETURNING id, period_id, status, created_at`,
+    [periodId, userId]
+  );
+  return rows[0];
+}
+
+
 // ---- final exports (no stub overwrite)
 module.exports = {
   getCurrentRunSummary,
@@ -386,5 +414,6 @@ module.exports = {
   approveCurrentRun: async () => ({ ok: true }),
   postCurrentRun: async () => ({ ok: true }),
   updateCurrentRunLine,      // (lineId, patch, userId)
-  updateCurrentRunStatus     // (status, userId)
+  updateCurrentRunStatus,   // (status, userId)
+  startForPeriod
 };

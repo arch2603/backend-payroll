@@ -10,8 +10,9 @@ const userRoutes = require("./routes/userRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const employeeRoutes = require("./routes/employeeRoutes");
 const historyRoutes = require("./routes/historyRoutes");
-
 const payRunRoutes = require("./routes/payRunRoutes");
+const payPeriodRoutes = require("./routes/payPeriodRoutes");
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -48,6 +49,7 @@ app.use('/api/dashboard', dashboardRoutes);       // counts, audit
 app.use('/api/employees', employeeRoutes);
 app.use('/api', historyRoutes);
 app.use('/api/pay-runs', payRunRoutes);
+app.use("/api/pay-periods", payPeriodRoutes);
 
 
 
