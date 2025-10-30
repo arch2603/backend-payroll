@@ -156,8 +156,7 @@ async function getCurrentRunSummary() {
     `, [run.id]);
 
     const s = sums.rows[0];
-
-    return {
+    const summary = {
       status: run.status,
       period: { start: run.period_start, end: run.period_end },
       totals: {
@@ -168,7 +167,9 @@ async function getCurrentRunSummary() {
         net:       Number(s.net       ?? 0)
       },
       items: []
-    };
+    }
+    console.log("[getCurrentSummary] found run:", summary);
+    return summary;
   } finally {
     client.release();
   }
