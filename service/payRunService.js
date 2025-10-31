@@ -97,54 +97,57 @@ async function getActiveRunId(client) {
 async function getCurrentRunSummary() {
   const client = await pool.connect();
   try {
-    // 1) Try the view
-    const { rows } = await client.query(`
-      SELECT 
-      id, 
-      period_start, 
-      period_end, 
-      status,
-      totals_employees, 
-      totals_gross,
-      totals_tax,
-      totals_deductions, 
-      totals_net, 
-      updated_at
-      FROM current_pay_run_summary
-      ORDER BY updated_at DESC
+    // 1) get the current period
+    const { rows: periodRows } = await client.query(`
+      SELECT id AS period_id,
+             COALESCE(start_date, period_start) AS start_date,
+             COALESCE(end_date, period_end) AS end_date
+      FROM pay_periods
+      WHERE is_current = TRUE
+      ORDER BY id DESC
       LIMIT 1
     `);
-    if (rows.length > 0) {
-      const r = rows[0];
+
+    if (!periodRows.length) {
+      // no current period at all
+      return null;
+    }
+
+    const period = periodRows[0];
+
+    // 2) get the pay run for this period
+    const { rows: runRows } = await client.query(`
+      SELECT id,
+             status
+      FROM pay_runs
+      WHERE period_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+    `, [period.period_id]);
+
+    if (!runRows.length) {
+      // period exists, but no run yet
       return {
-        status: r.status,
-        period: { start: r.period_start, end: r.period_end },
+        status: 'None',
+        period: {
+          start: period.start_date,
+          end: period.end_date,
+        },
         totals: {
-          employees: Number(r.totals_employees || 0),
-          gross: Number(r.totals_gross ?? 0),
-          tax: Number(r.totals_tax || 0),
-          deductions: Number(r.totals_deductions || 0),
-          net: Number(r.totals_net || 0),
+          employees: 0,
+          gross: 0,
+          tax: 0,
+          deductions: 0,
+          net: 0,
         },
         items: []
       };
     }
 
-    // 2) Fallback: compute from base tables for today's period
-    const meta = await client.query(`
-      SELECT r.id, r.status, pp.period_start, pp.period_end
-      FROM pay_runs r
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
-        AND r.status IN ('Draft','Approved','Posted')
-      ORDER BY r.updated_at DESC NULLS LAST
-      LIMIT 1
-    `);
-    if (meta.rows.length === 0) return null;
+    const run = runRows[0];
 
-    const run = meta.rows[0];
-
-    const sums = await client.query(`
+    // 3) aggregate items for this run
+    const { rows: sumRows } = await client.query(`
       SELECT
         COUNT(DISTINCT employee_id)::int             AS employees,
         COALESCE(SUM(gross),             0)::numeric AS gross,
@@ -155,45 +158,63 @@ async function getCurrentRunSummary() {
       WHERE pay_run_id = $1
     `, [run.id]);
 
-    const s = sums.rows[0];
-    const summary = {
+    const s = sumRows[0];
+
+    return {
       status: run.status,
-      period: { start: run.period_start, end: run.period_end },
+      period: {
+        start: period.start_date,
+        end: period.end_date,
+      },
       totals: {
         employees: Number(s.employees ?? 0),
-        gross:     Number(s.gross     ?? 0),
-        tax:       Number(s.tax       ?? 0),
-        deductions:Number(s.deductions?? 0),
-        net:       Number(s.net       ?? 0)
+        gross: Number(s.gross ?? 0),
+        tax: Number(s.tax ?? 0),
+        deductions: Number(s.deductions ?? 0),
+        net: Number(s.net ?? 0),
       },
-      items: []
-    }
-    console.log("[getCurrentSummary] found run:", summary);
-    return summary;
+      items: []   // summary endpoint doesn’t need full lines
+    };
   } finally {
     client.release();
   }
 }
 
-
 // -------- Controller expects an ARRAY (not {items,paging})
 async function getCurrentRunItems ({ search = '', limit = 25, offset = 0 } = {}) {
   const client = await pool.connect();
   try {
-    // find active run by date/status
-    const { rows: rid } = await client.query(`
-      SELECT r.id AS pay_run_id
-      FROM pay_runs r
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
-        AND r.status IN ('Draft','Approved','Posted')
-      ORDER BY r.updated_at DESC, r.created_at DESC
+    // 1) current period
+    const { rows: periodRows } = await client.query(`
+      SELECT id AS period_id
+      FROM pay_periods
+      WHERE is_current = TRUE
+      ORDER BY id DESC
       LIMIT 1
     `);
-    const runId = rid[0]?.pay_run_id;
-    if (!runId) return { items: [], paging: { search, limit, offset, total: 0 } };
 
-    // count
+    if (!periodRows.length) {
+      return { items: [], paging: { search, limit, offset, total: 0 } };
+    }
+
+    const periodId = periodRows[0].period_id;
+
+    // 2) run for that period
+    const { rows: runRows } = await client.query(`
+      SELECT id AS pay_run_id
+      FROM pay_runs
+      WHERE period_id = $1
+      ORDER BY id DESC
+      LIMIT 1
+    `, [periodId]);
+
+    if (!runRows.length) {
+      return { items: [], paging: { search, limit, offset, total: 0 } };
+    }
+
+    const runId = runRows[0].pay_run_id;
+
+    // 3) count
     const { rows: crows } = await client.query(
       `
       SELECT COUNT(*)::int AS total
@@ -210,14 +231,14 @@ async function getCurrentRunItems ({ search = '', limit = 25, offset = 0 } = {})
     );
     const total = crows[0].total;
 
-    // data
+    // 4) data
     const { rows } = await client.query(
       `
       SELECT
         l.id                                 AS line_id,
-        e.employee_id                         AS employee_id,
-        (e.first_name || ' ' || e.last_name)  AS employee_name,
-        l.rate                                 AS hourly_rate,
+        e.employee_id                        AS employee_id,
+        (e.first_name || ' ' || e.last_name) AS employee_name,
+        l.rate                                AS hourly_rate,
         l.hours,
         l.allowance,
         l.gross,

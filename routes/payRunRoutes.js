@@ -8,11 +8,12 @@ console.log('[payRunRoutes] typeof payRunCtrl =', typeof payRunCtrl);
 ['getCurrentSummary','getCurrentItems'].forEach(fn => {
   console.log(`[payRunRoutes] typeof ${fn} =`, typeof payRunCtrl?.[fn]);
 })
-
-router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
 router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
-router.get('/current/items', authenticateToken, payRunCtrl.getCurrentItems);
+
 router.get('/current', authenticateToken, payRunCtrl.getCurrent);
+router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
+router.get('/current/items', authenticateToken, payRunCtrl.getCurrentItems);
+
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);
 router.post('/current/recalculate', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.recalculateCurrent);
@@ -36,6 +37,35 @@ router.patch(
   authenticateToken, 
   authorizeRoles('admin', 'hr'),
   payRunCtrl.updateStatus);
+
+router.post(
+  '/current/items',
+  authenticateToken,
+  authorizeRoles('admin','hr'),
+  payRunCtrl.addCurrentItem
+);
+
+router.patch(
+  '/current/items/:id',             // <-- use :id to match your table
+  authenticateToken,
+  authorizeRoles('admin','hr'),
+  payRunCtrl.updateCurrentItem      // <-- rename to match controller I gave
+);
+
+router.delete(
+  '/current/items/:id',
+  authenticateToken,
+  authorizeRoles('admin','hr'),
+  payRunCtrl.deleteCurrentItem
+);
+
+router.patch(
+  '/current/status',
+  authenticateToken,
+  authorizeRoles('admin','hr'),
+  payRunCtrl.updateStatus
+);
+
 
 router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
 
