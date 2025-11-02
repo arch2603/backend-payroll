@@ -13,7 +13,12 @@ router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
 router.get('/current', authenticateToken, payRunCtrl.getCurrent);
 router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
 router.get('/current/items', authenticateToken, payRunCtrl.getCurrentItems);
-
+router.get(
+  '/current/validation',
+  authenticateToken,
+  authorizeRoles('admin','hr'),
+  payRunCtrl.getCurrentValidation
+);
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);
 router.post('/current/recalculate', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.recalculateCurrent);
@@ -26,12 +31,20 @@ router.post(
   payRunCtrl.startForPeriod
 );
 
+// router.patch(
+//   '/current/items/:id',
+//   authenticateToken,
+//   authorizeRoles('admin', 'hr'),     // only payroll-capable roles
+//   payRunCtrl.updateCurrentRunLine    // delegate to controller
+// );
+
 router.patch(
-  '/current/items/:line_id',
+  '/current/items/:id',             // <-- use :id to match your table
   authenticateToken,
-  authorizeRoles('admin', 'hr'),     // only payroll-capable roles
-  payRunCtrl.updateCurrentRunLine    // delegate to controller
+  authorizeRoles('admin','hr'),
+  payRunCtrl.updateCurrentItem      // <-- rename to match controller I gave
 );
+
 router.patch(
   '/current/status', 
   authenticateToken, 
@@ -45,27 +58,12 @@ router.post(
   payRunCtrl.addCurrentItem
 );
 
-router.patch(
-  '/current/items/:id',             // <-- use :id to match your table
-  authenticateToken,
-  authorizeRoles('admin','hr'),
-  payRunCtrl.updateCurrentItem      // <-- rename to match controller I gave
-);
-
 router.delete(
   '/current/items/:id',
   authenticateToken,
   authorizeRoles('admin','hr'),
   payRunCtrl.deleteCurrentItem
 );
-
-router.patch(
-  '/current/status',
-  authenticateToken,
-  authorizeRoles('admin','hr'),
-  payRunCtrl.updateStatus
-);
-
 
 router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
 

@@ -1,8 +1,9 @@
 // service/payRunService.js
+const { number } = require('zod');
 const pool = require('../db');
 
 // ---- helper: recalc a single line
-async function recalcLine(client, lineId) {
+async function recalcLine(client, id) {
   const { rows: lineRows } = await client.query(`
     SELECT 
       id, employee_id, pay_run_id,
@@ -11,10 +12,10 @@ async function recalcLine(client, lineId) {
       COALESCE(allowance,0)              AS allowance,
       COALESCE(tax,0)                    AS tax,
       COALESCE("super",0)                AS "super",
-      COALESCE(post_tax_deductions,0)    AS post_tax_deductions
+      COALESCE(deductions_total,0)    AS deductions_total
     FROM pay_run_items
     WHERE id = $1
-  `, [lineId]);
+  `, [id]);
 
   if (lineRows.length === 0) return null;
 
@@ -23,13 +24,13 @@ async function recalcLine(client, lineId) {
   // TODO: replace with your real tax/super calc or DB function
   const tax = Number(L.tax || 0);
   const sup = Number(L.super || 0);
-  const net = gross - tax - Number(L.post_tax_deductions || 0) - sup;
+  const net = gross - tax - Number(L.deductions_total || 0) - sup;
 
   await client.query(`
     UPDATE pay_run_items
        SET gross = $2, tax = $3, "super" = $4, net = $5, updated_at = NOW()
      WHERE id = $1
-  `, [lineId, gross, tax, sup, net]);
+  `, [id, gross, tax, sup, net]);
 
   const { rows: updated } = await client.query(`
     SELECT id as line_id, employee_id, pay_run_id,
@@ -37,7 +38,7 @@ async function recalcLine(client, lineId) {
            post_tax_deductions as deductions, net, status
     FROM pay_run_items 
     WHERE id = $1
-  `, [lineId]);
+  `, [id]);
 
   return updated[0];
 }
@@ -181,7 +182,7 @@ async function getCurrentRunSummary() {
 }
 
 // -------- Controller expects an ARRAY (not {items,paging})
-async function getCurrentRunItems ({ search = '', limit = 25, offset = 0 } = {}) {
+async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) {
   const client = await pool.connect();
   try {
     // 1) current period
@@ -280,7 +281,7 @@ async function getCurrentRunItems ({ search = '', limit = 25, offset = 0 } = {})
   } finally {
     client.release();
   }
-};
+}
 
 async function getCurrentRun() {
   const client = await pool.connect();
@@ -305,7 +306,7 @@ async function getCurrentRun() {
         (e.first_name || ' ' || e.last_name)                  AS emp_name,
         COALESCE(l.gross,0)::numeric(12,2)                    AS gross,
         COALESCE(l.tax,0)::numeric(12,2)                      AS tax,
-        COALESCE(l.post_tax_deductions,0)::numeric(12,2)      AS deductions,
+        COALESCE(l.deductions_total,0)::numeric(12,2)      AS deductions,
         COALESCE(l.net,0)::numeric(12,2)                      AS net
       FROM pay_run_items l
       JOIN employee e ON e.employee_id = l.employee_id
@@ -328,7 +329,7 @@ async function getCurrentRun() {
 }
 
 // Align with controller: (lineId, patch, userId)
-async function updateCurrentRunLine(lineId, patch, userId) {
+async function updateCurrentItem(id, patch, userId) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -343,7 +344,7 @@ async function updateCurrentRunLine(lineId, patch, userId) {
         AND CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
         AND r.status IN ('Draft','Approved','Posted')
       FOR UPDATE
-    `, [lineId]);
+    `, [id]);
 
     if (chk.length === 0) {
       await client.query('ROLLBACK');
@@ -352,11 +353,39 @@ async function updateCurrentRunLine(lineId, patch, userId) {
 
     const runId = chk[0].pay_run_id;
 
+    const { _recalc, ...realPatch } = patch;
+
     const sets = [];
-    const vals = [lineId];
-    if (patch.hours !== undefined)     { vals.push(patch.hours);     sets.push(`hours     = $${vals.length}`); }
-    if (patch.allowance !== undefined) { vals.push(patch.allowance); sets.push(`allowance = $${vals.length}`); }
-    if (patch.note !== undefined)      { vals.push(patch.note);      sets.push(`note      = $${vals.length}`); }
+    const vals = [id];
+
+    if (realPatch.hours !== undefined) {
+      vals.push(patch.hours);
+      sets.push(`hours = $${vals.length}`);
+    }
+    if (realPatch.rate !== undefined) {
+      vals.push(patch.rate);
+      sets.push(`rate = $${vals.length}`);
+    }
+    if (realPatch.allowance !== undefined) {
+      vals.push(patch.allowance);
+      sets.push(`allowance = $${vals.length}`);
+    }
+    if (realPatch.tax !== undefined) {
+      vals.push(patch.tax);
+      sets.push(`tax = $${vals.length}`);
+    }
+    if (realPatch.deductions !== undefined) {
+      vals.push(patch.deductions);
+      sets.push(`deductions_total = $${vals.length}`);
+    }
+    if (realPatch.super !== undefined) {
+      vals.push(patch.super);
+      sets.push(`super = $${vals.length}`);
+    }
+    if (realPatch.note !== undefined) {
+      vals.push(patch.note);
+      sets.push(`note = $${vals.length}`);
+    }
 
     if (sets.length) {
       vals.push(userId || null);
@@ -366,8 +395,8 @@ async function updateCurrentRunLine(lineId, patch, userId) {
       );
     }
 
-    const updatedLine = await recalcLine(client, lineId);
-    const summary     = await recomputeRunSummary(client, runId);
+    const updatedLine = await recalcLine(client, id);
+    const summary = await recomputeRunSummary(client, runId);
 
     await client.query('COMMIT');
     return { line: updatedLine, summary };
@@ -399,30 +428,257 @@ async function updateCurrentRunStatus(status, userId) {
 }
 
 async function startForPeriod(periodId, userId = null) {
-  // make sure period exists
-  const { rows: p } = await db.query(
-    `SELECT id FROM pay_periods WHERE id = $1`,
-    [periodId]
-  );
-  if (!p.length) throw new Error("Period not found");
+  const client = await pool.connect();
+  try {
 
-  // check if a run already exists for this period
-  const { rows: existing } = await db.query(
-    `SELECT id FROM pay_runs WHERE period_id = $1 LIMIT 1`,
-    [periodId]
-  );
-  if (existing.length) {
-    // either return existing, or throw
-    return existing[0];
-  }
+    const { rows: p } = await client.query(`SELECT id FROM pay_periods WHERE id = $1`,
+      [periodId]);
 
-  const { rows } = await db.query(
-    `INSERT INTO pay_runs (period_id, status, created_by, created_at)
+    if (!p.length) throw new Error("Period not found");
+
+    // check if a run already exists for this period
+    const { rows: existing } = await client.query(
+      `SELECT id FROM pay_runs WHERE period_id = $1 LIMIT 1`,
+      [periodId]
+    );
+
+    if (existing.length) {
+      return existing[0];
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO pay_runs (period_id, status, created_by, created_at)
      VALUES ($1, 'Draft', $2, now())
      RETURNING id, period_id, status, created_at`,
-    [periodId, userId]
-  );
-  return rows[0];
+      [periodId, userId]
+    );
+    return rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+async function validateCurrentRun() {
+  const client = await pool.connect();
+
+  try {
+    const period = await getCurrentPeriod(client);
+    if (!period) {
+      return { ok: false, errors: ['NO current period found'] };
+    }
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (!run) {
+      return { ok: false, errors: ['No pay run started for current period'] };
+    }
+
+    const { rows: items } = await client.query(`
+      SELECT pri.*, e.hourly_rate 
+      FROM pay_run_items pri
+      LEFT JOIN employee e ON e.employee_id = pri.employee_id
+      WHERE pri.pay_run_id = $1
+      `, [run.id]);
+
+    const errors = [];
+
+    if (items.length === 0) {
+      errors.push('No pay run items found. ');
+    }
+
+    for (const it of items) {
+      if ((it.hours == null || Number(it.hours) === 0) && (it.gross === null || Number(it.gross) === 0)) {
+        errors.push(`Item ${it.id}: zero hours and zero gross`);
+      }
+      if (!it.hourly_rate && !it.gross) {
+        errors.push(`Employee ${it.employee_id}: no hourly rate and no gross set.`)
+      }
+    }
+
+    return {
+      ok: errors.length === 0,
+      errors,
+    };
+
+  } finally {
+    client.release();
+  }
+}
+
+async function getCurrentPeriod(client) {
+  const { rows } = await client.query(`
+    SELECT id, 
+      COALESCE(start_date, period_start) AS start_date,
+      COALESCE(end_date, period_end) AS end_date
+      FROM pay_periods
+      WHERE is_current = TRUE
+      ORDER BY id DESC
+      LIMIT 1
+    `)
+  return rows[0] || null;
+}
+
+async function getCurrentRunRow(client, periodId) {
+  const { rows } = await client.query(`
+    SELECT id, status FROM pay_runs
+    WHERE period_id = $1
+    ORDER BY id DESC
+    LIMIT 1  
+  `, [periodId]);
+  return rows[0] || null;
+}
+
+async function addCurrentRunItem(payload) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const period = await getCurrentPeriod(client);
+    if (!period) throw new Error('No current period');
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (!run) throw new Error('No current run for current period');
+
+    if (run.status !== 'Draft') {
+      throw new Error('Run not in Draft, cannot add items');
+    }
+
+    const {
+      employee_id,
+      hours = 0,
+      rate = 0,
+      allowance = 0,
+      tax = 0,
+      deductions_total = 0,
+      super_amount = 0,
+      note = null,
+    } = payload;
+
+    const gross = (Number(hours) * Number(rate)) + Number(allowance);
+    const net = gross - Number(tax) - Number(deductions_total) - Number(super_amount);
+
+    const { rows } = await client.query(`
+      INSERT INTO pay_run_items
+        (pay_run_id, employee_id, hours, rate, allowance,
+         gross, tax, deductions_total, super, net, note)
+      VALUES
+        ($1, $2, $3, $4, $5,
+         $6, $7, $8, $9, $10, $11)
+      RETURNING *;
+    `, [
+      run.id,
+      employee_id,
+      hours,
+      rate,
+      allowance,
+      gross,
+      tax,
+      deductions_total,
+      super_amount,
+      net,
+      note
+    ]);
+
+    await recomputeRunSummary(client, run.id);
+    await client.query('COMMIT');
+    return rows[0];
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function startCurrentRun(userId = null) {
+  const client = await pool.connect();
+  try {
+    const period = await getCurrentPeriod(client);
+    if (!period) throw new Error('No current period');
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (run) return run;
+
+    const { rows } = await client.query(`
+      INSERT INTO pay_runs (period_id, status, created_by, created_at)
+      VALUES ($1, 'DRAFT', $2, NOW())
+      RETURNING id, period_id, status
+      `, [period.id, userId]);
+
+    return rows[0];
+  } finally {
+    client.release();
+  }
+}
+
+async function recalcCurrentRun() {
+  const client = await pool.connect();
+  try {
+    const runId = await getActiveRunId(client);
+    if (!runId) return { ok: false, message: 'No active run' };
+    const summary = await recomputeRunSummary(client, runId);
+    return { ok: true, run_id: runId, ...summary };
+  } finally {
+    client.release();
+  }
+}
+
+async function approveCurrentRun(userId = null) {
+  return updateCurrentRunStatus('Approved', userId);
+}
+
+async function postCurrentRun(userId = null) {
+  const client = await pool.connect();
+  try {
+    const runId = await getActiveRunId(client);
+    if (!runId) throw new Error('No active run');
+
+    const { rows } = await client.query(`
+        SELECT status FROM pay_runs WHERE id = $1
+      `, [runId]);
+
+    const currentStatus = rows[0]?.status;
+
+    if (currentStatus !== 'Approved') { throw new Error('Run must be Approved before it can be posted') }
+
+    return updateCurrentRunStatus('Posted', userId);
+  } finally {
+    client.release();
+  }
+}
+
+async function deleteCurrentItem(id) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // find the line + run
+    const { rows } = await client.query(`
+      SELECT l.pay_run_id, r.status
+      FROM pay_run_items l
+      JOIN pay_runs r ON r.id = l.pay_run_id
+      WHERE l.id = $1
+      FOR UPDATE
+    `, [id]);
+
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return { ok: true }; // already gone
+    }
+
+    const { pay_run_id, status } = rows[0];
+    if (status !== 'Draft') {
+      throw new Error('Run not in Draft, cannot delete item');
+    }
+
+    await client.query(`DELETE FROM pay_run_items WHERE id = $1`, [id]);
+    await recomputeRunSummary(client, pay_run_id);
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 
@@ -431,11 +687,15 @@ module.exports = {
   getCurrentRunSummary,
   getCurrentRunItems,   // returns ARRAY
   getCurrentRun,
-  startCurrentRun: async () => ({ ok: true }), // fill in when ready
-  recalcCurrentRun: async () => ({ ok: true }),
-  approveCurrentRun: async () => ({ ok: true }),
-  postCurrentRun: async () => ({ ok: true }),
-  updateCurrentRunLine,      // (lineId, patch, userId)
+  startCurrentRun, // fill in when ready
+  recalcCurrentRun,
+  approveCurrentRun,
+  postCurrentRun,
+  updateCurrentItem,      // (lineId, patch, userId)
   updateCurrentRunStatus,   // (status, userId)
-  startForPeriod
+  startForPeriod,
+  validateCurrentRun,
+  addCurrentRunItem,
+  deleteCurrentItem,
+
 };

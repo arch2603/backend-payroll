@@ -1,18 +1,27 @@
 const { z } = require('zod');
 let payRunService;
 try {
-    payRunService = require('../service/payRunService');
+  payRunService = require('../service/payRunService');
 } catch (error) {
-    console.warn('[payRun] payRunService not found - using safe fallbacks');
-    payRunService = null;
+  console.warn('[payRun] payRunService not found - using safe fallbacks');
+  payRunService = null;
 };
 
-// ---- Validation schema for PATCH body
+const numLike = z.coerce.number();
+
 const UpdateLineSchema = z.object({
-  hours: z.number().finite().min(0).max(1000).optional(),
-  allowance: z.number().finite().min(0).max(1e9).optional(),
+  _recalc: z.any().optional(),
+  hours: numLike.min(0).max(1000).optional(),
+  rate: numLike.min(0).max(1e9).optional(),
+  allowance: numLike.min(0).max(1e9).optional(),
+  tax: numLike.min(0).max(1e9).optional(),
+  deductions: numLike.min(0).max(1e9).optional(),       // we'll map this below
+  super: numLike.min(0).max(1e9).optional(),
   note: z.string().max(500).optional()
-}).refine(obj => Object.keys(obj).length > 0, { message: 'No fields to update' });
+}).refine(obj => {
+  const { _reclac, ...rest } = obj;
+  return Object.keys(obj).length > 0 || _reclac;
+}, { message: 'No fields to update' });
 
 
 function emptySummary() {
@@ -24,7 +33,7 @@ function emptySummary() {
   };
 }
 
-const ensureArray  = v => Array.isArray(v) ? v : [];
+const ensureArray = v => Array.isArray(v) ? v : [];
 const ensureTotals = v => v ?? { employees: 0, gross: 0, tax: 0, deductions: 0, net: 0 };
 
 
@@ -39,7 +48,7 @@ exports.getCurrentSummary = async (req, res) => {
     return res.json({
       status: summary.status ?? 'Draft',
       period: summary.period ?? null,
-      totals: ensureTotals(summary.totals), 
+      totals: ensureTotals(summary.totals),
       items: ensureArray(summary.items)
     });
   } catch (err) {
@@ -52,15 +61,15 @@ exports.getCurrentItems = async (req, res) => {
   try {
     const { search = '', limit = 25, offset = 0 } = req.query;
     const result = await payRunService?.getCurrentRunItems?.({
-        search: String(search),
-        limit: Number(limit) || 25,
-        offset: Number(offset) || 0
+      search: String(search),
+      limit: Number(limit) || 25,
+      offset: Number(offset) || 0
     });
 
-    if(!result) {
-        return res.json({status: 'None', items: []});
+    if (!result) {
+      return res.json({ status: 'None', items: [] });
     }
-    
+
     return res.json({ status: 'Draft', ...result });
   } catch (err) {
     console.error('[payRun] getCurrentItems error:', err);
@@ -86,7 +95,7 @@ exports.getCurrent = async (req, res) => {
 
 exports.startCurrent = async (req, res) => {
   try {
-    const result = (await payRunService?.startCurrentRun?.()) ?? {ok: true};
+    const result = (await payRunService?.startCurrentRun?.()) ?? { ok: true };
     return res.json(result);
   } catch (err) {
     console.error('[payRun] startCurrent error:', err);
@@ -96,7 +105,7 @@ exports.startCurrent = async (req, res) => {
 
 exports.recalculateCurrent = async (req, res) => {
   try {
-    const result = (await payRunService?.recalcCurrentRun?.()) ?? {ok : true};
+    const result = (await payRunService?.recalcCurrentRun?.()) ?? { ok: true };
     return res.json(result);
   } catch (err) {
     console.error('[payRun] recalculateCurrent error:', err);
@@ -106,7 +115,7 @@ exports.recalculateCurrent = async (req, res) => {
 
 exports.approveCurrent = async (req, res) => {
   try {
-    const result = await payRunService?.approveCurrentRun?.()?? {ok: true};
+    const result = await payRunService?.approveCurrentRun?.() ?? { ok: true };
     return res.json(result);
   } catch (err) {
     console.error('[payRun] approveCurrent error:', err);
@@ -116,7 +125,7 @@ exports.approveCurrent = async (req, res) => {
 
 exports.postCurrent = async (req, res) => {
   try {
-    const result = await payRunService?.postCurrentRun?.()?? {ok: true};
+    const result = await payRunService?.postCurrentRun?.() ?? { ok: true };
     return res.json(result);
   } catch (err) {
     console.error('[payRun] postCurrent error:', err);
@@ -125,25 +134,25 @@ exports.postCurrent = async (req, res) => {
 };
 
 // PATCH /api/pay-runs/current/items/:line_id { hours }
-exports.updateCurrentRunLine = async (req, res) => {
+exports.updateCurrentItem = async (req, res) => {
   try {
-    const { line_id } = req.params;
+    const { id } = req.params;
     let body;
     try {
-        body = UpdateLineSchema.parse(req.body);
+      body = UpdateLineSchema.parse(req.body);
 
     } catch (error) {
-        return res.status(400).json({message: error.errors?.[0]?.message || 'Invalid payload'});
+      return res.status(400).json({ message: error.errors?.[0]?.message || 'Invalid payload' });
     }
 
-     if (!payRunService?.updateCurrentRunLine) {
-      console.warn('[payRun] updateCurrentRunLine not implemented; returning ok:true');
+    if (!payRunService?.updateCurrentItem) {
+      console.warn('[payRun] updateCurrentItem not implemented; returning ok:true');
       return res.json({ ok: true });
     }
-    const result = await payRunService?.updateCurrentRunLine?.(Number(line_id), body, req.user?.user_id)
+    const result = await payRunService?.updateCurrentItem?.(Number(id), body, req.user?.user_id)
     return res.json(result ?? { ok: true });
   } catch (err) {
-    console.error('[payRun] updateCurrentRunLine error:', err);
+    console.error('[payRun] updateCurrentItem error:', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
@@ -179,5 +188,43 @@ exports.startForPeriod = async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 };
+
+exports.getCurrentValidation = async (req, res) => {
+  try {
+    const result = await payRunService.validateCurrentRun();
+    return res.json(result);
+  } catch (err) {
+    console.error('[payRun] getCurrentValidation error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.addCurrentItem = async (req, res) => {
+  try {
+    if (!payRunService?.addCurrentRunItem) {
+      return res.status(501).json({ message: 'addCurrentRunItem not implemented' });
+    }
+    const item = await payRunService.addCurrentRunItem(req.body, req.user?.user_id);
+    return res.status(201).json(item);
+  } catch (err) {
+    console.error('[payRun] addCurrentRunItem error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.deleteCurrentItem = async (req, res) => {
+  try {
+    if (!payRunService?.deleteCurrentItem) {
+      return res.status(501).json({ message: 'deleteCurrentItem not implemented' });
+    }
+    await payRunService.deleteCurrentItem(Number(req.params.id), req.user?.user_id);
+    return res.status(204).send();
+  } catch (err) {
+    console.error('[payRun] deleteCurrentItem error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+
 
 
