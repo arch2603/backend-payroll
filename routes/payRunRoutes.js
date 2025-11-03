@@ -19,6 +19,8 @@ router.get(
   authorizeRoles('admin','hr'),
   payRunCtrl.getCurrentValidation
 );
+router.get('/current/export/stp-preview', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.getStpPreview);
+
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);
 router.post('/current/recalculate', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.recalculateCurrent);
@@ -30,13 +32,6 @@ router.post(
   authorizeRoles("admin","hr"),
   payRunCtrl.startForPeriod
 );
-
-// router.patch(
-//   '/current/items/:id',
-//   authenticateToken,
-//   authorizeRoles('admin', 'hr'),     // only payroll-capable roles
-//   payRunCtrl.updateCurrentRunLine    // delegate to controller
-// );
 
 router.patch(
   '/current/items/:id',             // <-- use :id to match your table

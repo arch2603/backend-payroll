@@ -342,7 +342,7 @@ async function updateCurrentItem(id, patch, userId) {
       JOIN pay_periods pp ON pp.id = r.period_id
       WHERE l.id = $1 
         AND CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
-        AND r.status IN ('Draft','Approved','Posted')
+        AND r.status IN ('Draft')
       FOR UPDATE
     `, [id]);
 
@@ -413,15 +413,17 @@ async function updateCurrentRunStatus(status, userId) {
   const sql = `
     UPDATE pay_runs
     SET status = $1,
-        approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
-        approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END
+      approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
+      approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END
     WHERE id = (
-      SELECT id FROM pay_runs
-      WHERE status != 'Posted'
-      ORDER BY created_at DESC
-      LIMIT 1
-    )
-    RETURNING *;
+    SELECT r.id
+    FROM pay_runs r
+    JOIN pay_periods pp ON pp.id = r.period_id
+    WHERE pp.is_current = TRUE
+    ORDER BY r.created_at DESC
+    LIMIT 1
+  )
+  RETURNING *;
   `;
   const { rows } = await pool.query(sql, [status, userId || null]);
   return rows[0] || null;
@@ -612,19 +614,71 @@ async function startCurrentRun(userId = null) {
 
 async function recalcCurrentRun() {
   const client = await pool.connect();
+
   try {
+    await client.query('BEGIN');
     const runId = await getActiveRunId(client);
-    if (!runId) return { ok: false, message: 'No active run' };
+    if (!runId) {
+      await client.query('ROLLBACK');
+      return { ok: false, message: 'No active run' };
+    }
+
+    const { rows: lines } = await client.query(`
+      SELECT id FROM pay_run_items WHERE pay_run_id = $1
+      `, [runId]);
+
+    for (const row of lines) {
+      await recalcLine(client, row.id);
+    }
     const summary = await recomputeRunSummary(client, runId);
     return { ok: true, run_id: runId, ...summary };
+  } catch (error) {
+    await client.query('ROLLBACK');
   } finally {
     client.release();
   }
 }
 
 async function approveCurrentRun(userId = null) {
-  return updateCurrentRunStatus('Approved', userId);
+  const client = await pool.connect();
+  // console.log("[approveCurrentRun] from:", JSON.stringify(fromStatus), "to:", toStatus);
+  try {
+    await client.query('BEGIN');
+
+    const period = await getCurrentPeriod(client);
+    if (!period) throw new Error('No current period');
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (!run) throw new Error('No current run');
+
+    if (run.stats !== 'Draft') {
+      const msg = `Cannot approve a run with status "${run.status}". Only Draft runs can be approved.`;
+      console.warn('[payRun] approve blocked:', msg);
+      return { ok: false, message: msg };
+    }
+
+    const v = await validateCurrentRun();
+    if (!v.ok) {
+      throw new Error('Validation failed: ' + v.errors.join(';'));
+    }
+
+    const { rows } = await client.query(`
+      UPDATE pay_runs
+      SET status = 'Approved',
+      approved_by = $1,
+      approved_at = NOW()
+      WHERE id = $2
+      RETURNING *;
+      `, [userId, run.id]);
+
+    await client.query('COMMIT');
+    return {rows: rows[0], ok: true, message: 'Run approved successfully'};
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error
+  }
 }
+
 
 async function postCurrentRun(userId = null) {
   const client = await pool.connect();

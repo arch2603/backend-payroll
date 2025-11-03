@@ -4,6 +4,7 @@ try {
   payRunService = require('../service/payRunService');
 } catch (error) {
   console.warn('[payRun] payRunService not found - using safe fallbacks');
+  console.warn("[payRun] require error was:", error); 
   payRunService = null;
 };
 
@@ -19,8 +20,11 @@ const UpdateLineSchema = z.object({
   super: numLike.min(0).max(1e9).optional(),
   note: z.string().max(500).optional()
 }).refine(obj => {
-  const { _reclac, ...rest } = obj;
-  return Object.keys(obj).length > 0 || _reclac;
+
+  if(obj._recalc) return true;
+  return Object.keys(obj).some( k => 
+  ['hours', 'rate', 'allowance', 'tax', 'deductions', 'suoer', 'note'].includes(k)
+  );
 }, { message: 'No fields to update' });
 
 
@@ -115,7 +119,11 @@ exports.recalculateCurrent = async (req, res) => {
 
 exports.approveCurrent = async (req, res) => {
   try {
-    const result = await payRunService?.approveCurrentRun?.() ?? { ok: true };
+    
+    const result = await payRunService.approveCurrentRun(req.user?.id);
+    if (result?.ok === false) {
+      return res.status(400).json({ message: result.message });
+    }
     return res.json(result);
   } catch (err) {
     console.error('[payRun] approveCurrent error:', err);
@@ -191,6 +199,15 @@ exports.startForPeriod = async (req, res) => {
 
 exports.getCurrentValidation = async (req, res) => {
   try {
+    // 1) service not loaded? return safe default
+    if (!payRunService) {
+      console.warn("[payRun] validateCurrentRun called but payRunService is NULL");
+      return res.json({ ok: true, errors: [] });
+    }
+    if (typeof payRunService.validateCurrentRun !== "function") {
+      console.warn("[payRun] validateCurrentRun is missing on service");
+      return res.json({ ok: true, errors: [] });
+    }
     const result = await payRunService.validateCurrentRun();
     return res.json(result);
   } catch (err) {
