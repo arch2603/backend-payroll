@@ -1,8 +1,15 @@
-// service/payRunService.js
+
 const { number } = require('zod');
 const pool = require('../db');
 
-// ---- helper: recalc a single line
+function periodStartSQL(alias = 'pp') {
+  return `COALESCE(${alias}.start_date, ${alias}.period_start)`;
+}
+
+function periodEndSQL(alias = 'pp') {
+  return `COALESCE(${alias}.end_date, ${alias}.period_end)`;
+}
+
 async function recalcLine(client, id) {
   const { rows: lineRows } = await client.query(`
     SELECT 
@@ -78,15 +85,17 @@ async function recomputeRunSummary(client, runId) {
 
 async function getActiveRunId(client) {
   // Prefer your view if present
-  const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
-  if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
+  try {
+    const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
+    if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
+  } catch (error) { }
 
   // Fallback by date + status (adjust statuses to your enum)
   const q = await client.query(`
     SELECT r.id AS pay_run_id
     FROM pay_runs r
     JOIN pay_periods pp ON pp.id = r.period_id
-    WHERE CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+    WHERE CURRENT_DATE BETWEEN ${periodStartSQL()} AND ${periodEndSQL()}
       AND r.status IN ('Draft','Approved','Posted')
     ORDER BY r.updated_at DESC NULLS LAST
     LIMIT 1
@@ -322,7 +331,16 @@ async function getCurrentRun() {
       net: Number(r.net),
     }));
 
-    return { status, period: { start, end }, items };
+    const totals = items.reduce((t, r) => ({
+      ...t,
+      employees: t.employees + 1,
+      gross: t.gross + r.gross,
+      tax: t.tax + r.tax,
+      deductions: t.deductions + r.deductions,
+      net: t.net + r.net
+    }), { employees: 0, gross: 0, tax: 0, deductions: 0, net: 0 });
+
+    return { status, period: { start, end }, items, totals };
   } finally {
     client.release();
   }
@@ -409,24 +427,73 @@ async function updateCurrentItem(id, patch, userId) {
 }
 
 // Align with controller: (status, userId)
-async function updateCurrentRunStatus(status, userId) {
+async function updateCurrentRunStatus(status, userId, { allowApprovedToDraft = false } = {}) {
+  
+  const allowedTargets = new Set(['Draft', 'Approved', 'Posted']);
+  if (!allowedTargets.has(status)) {
+    throw new Error(`Unknown target status: ${status}`);
+  }
+
+  const allowRollback = allowApprovedToDraft ? `OR r.status = 'Approved' AND $1 = 'Draft'` : '';
+
   const sql = `
-    UPDATE pay_runs
-    SET status = $1,
-      approved_by = CASE WHEN $1 = 'Approved' THEN $2 ELSE approved_by END,
-      approved_at = CASE WHEN $1 = 'Approved' THEN NOW() ELSE approved_at END
-    WHERE id = (
-    SELECT r.id
-    FROM pay_runs r
-    JOIN pay_periods pp ON pp.id = r.period_id
-    WHERE pp.is_current = TRUE
-    ORDER BY r.created_at DESC
-    LIMIT 1
-  )
-  RETURNING *;
-  `;
-  const { rows } = await pool.query(sql, [status, userId || null]);
-  return rows[0] || null;
+    WITH cur AS (
+      SELECT r.id, r.status
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE pp.is_current = TRUE
+      ORDER BY r.created_at DESC
+      LIMIT 1
+    )
+    UPDATE pay_runs pr
+    SET
+      status = $1,
+      approved_by = CASE
+        WHEN $1 = 'Approved' THEN $2
+        WHEN pr.status = 'Approved' AND $1 <> 'Approved' THEN NULL
+        ELSE approved_by
+      END,
+      approved_at = CASE
+        WHEN $1 = 'Approved' THEN NOW()
+        WHEN pr.status = 'Approved' AND $1 <> 'Approved' THEN NULL
+        ELSE approved_at
+      END
+    FROM cur
+    WHERE pr.id = cur.id
+      AND (
+        pr.status = $1                               
+        OR (pr.status = 'Draft' AND $1 = 'Approved') 
+        OR (pr.status = 'Approved' AND $1 = 'Posted')
+        ${allowRollback}                            
+      )
+    RETURNING pr.*;`;
+
+  const { rows } = await pool.query(sql, [status, userId || null, allowApprovedToDraft]);
+
+  if (rows.length === 0) {
+    // Either no current run, or invalid transition
+    // Fetch current to produce a precise error
+    const { rows: curRows } = await pool.query(`
+      SELECT r.id, r.status
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE pp.is_current = TRUE
+      ORDER BY r.created_at DESC
+      LIMIT 1
+    `);
+
+    if (!curRows.length) return null; // no current period/run
+
+    const cur = curRows[0];
+    throw new Error(
+      `Invalid transition ${cur.status} → ${status}. Allowed: ` +
+      (allowApprovedToDraft
+        ? `Draft→Approved, Approved→Posted, Approved→Draft, or no-op.`
+        : `Draft→Approved, Approved→Posted, or no-op.`)
+    );
+  }
+
+  return rows[0];
 }
 
 async function startForPeriod(periodId, userId = null) {
@@ -602,7 +669,7 @@ async function startCurrentRun(userId = null) {
 
     const { rows } = await client.query(`
       INSERT INTO pay_runs (period_id, status, created_by, created_at)
-      VALUES ($1, 'DRAFT', $2, NOW())
+      VALUES ($1, 'Draft', $2, NOW())
       RETURNING id, period_id, status
       `, [period.id, userId]);
 
@@ -651,7 +718,7 @@ async function approveCurrentRun(userId = null) {
     const run = await getCurrentRunRow(client, period.id);
     if (!run) throw new Error('No current run');
 
-    if (run.stats !== 'Draft') {
+    if (run.status !== 'Draft') {
       const msg = `Cannot approve a run with status "${run.status}". Only Draft runs can be approved.`;
       console.warn('[payRun] approve blocked:', msg);
       return { ok: false, message: msg };
@@ -672,13 +739,12 @@ async function approveCurrentRun(userId = null) {
       `, [userId, run.id]);
 
     await client.query('COMMIT');
-    return {rows: rows[0], ok: true, message: 'Run approved successfully'};
+    return { rows: rows[0], ok: true, message: 'Run approved successfully' };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error
   }
 }
-
 
 async function postCurrentRun(userId = null) {
   const client = await pool.connect();
@@ -735,9 +801,41 @@ async function deleteCurrentItem(id) {
   }
 }
 
+async function getStpPreview() {
+  const client = await pool.connect();
+  try {
+    const runId = await getActiveRunId(client);
+    if (!runId) return { ok: false, message: 'No active run', employees: [], totals: {} };
+
+    const { rows: lines } = await client.query(`
+      SELECT e.employee_id, e.first_name, e.last_name,
+             COALESCE(l.gross,0) AS gross, COALESCE(l.tax,0) AS tax, COALESCE(l.super,0) AS super
+      FROM pay_run_items l
+      JOIN employee e ON e.employee_id = l.employee_id
+      WHERE l.pay_run_id = $1
+    `, [runId]);
+
+    const employees = lines.map(r => ({
+      employee_id: r.employee_id,
+      name: `${r.first_name} ${r.last_name}`,
+      tfn: '000000000', // placeholder
+      ytd: { gross: Number(r.gross), tax: Number(r.tax), super: Number(r.super) }
+    }));
+    const totals = employees.reduce((t, e) => ({
+      gross: t.gross + e.ytd.gross,
+      tax: t.tax + e.ytd.tax,
+      super: t.super + e.ytd.super
+    }), { gross: 0, tax: 0, super: 0 });
+
+    return { ok: true, employees, totals };
+  } finally {
+    client.release();
+  }
+}
 
 // ---- final exports (no stub overwrite)
 module.exports = {
+  getStpPreview,
   getCurrentRunSummary,
   getCurrentRunItems,   // returns ARRAY
   getCurrentRun,

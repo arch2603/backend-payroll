@@ -5,7 +5,7 @@ const payRunCtrl = require('../controllers/payRunController');
 
 console.log('[payRunRoutes] typeof authenticateToken =', typeof authenticateToken);
 console.log('[payRunRoutes] typeof payRunCtrl =', typeof payRunCtrl);
-['getCurrentSummary','getCurrentItems'].forEach(fn => {
+['getCurrentSummary','getCurrentItems','getCurrent','startCurrent','recalculateCurrent','approveCurrent','postCurrent'].forEach(fn => {
   console.log(`[payRunRoutes] typeof ${fn} =`, typeof payRunCtrl?.[fn]);
 })
 router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
@@ -13,13 +13,14 @@ router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
 router.get('/current', authenticateToken, payRunCtrl.getCurrent);
 router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
 router.get('/current/items', authenticateToken, payRunCtrl.getCurrentItems);
+router.get('/current/export/stp-preview', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.getStpPreview);
 router.get(
   '/current/validation',
   authenticateToken,
   authorizeRoles('admin','hr'),
   payRunCtrl.getCurrentValidation
 );
-router.get('/current/export/stp-preview', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.getStpPreview);
+//router.get('/current/export/stp-preview', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.getStpPreview);
 
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);

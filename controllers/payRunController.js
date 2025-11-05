@@ -23,7 +23,7 @@ const UpdateLineSchema = z.object({
 
   if(obj._recalc) return true;
   return Object.keys(obj).some( k => 
-  ['hours', 'rate', 'allowance', 'tax', 'deductions', 'suoer', 'note'].includes(k)
+  ['hours', 'rate', 'allowance', 'tax', 'deductions', 'super', 'note'].includes(k)
   );
 }, { message: 'No fields to update' });
 
@@ -238,6 +238,16 @@ exports.deleteCurrentItem = async (req, res) => {
     return res.status(204).send();
   } catch (err) {
     console.error('[payRun] deleteCurrentItem error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+exports.getStpPreview = async (_req, res) => {
+  try {
+    const data = await payRunService?.getStpPreview?.();
+    return res.json(data ?? { ok: true, employees: [], totals: {} });
+  } catch (err) {
+    console.error('[payRun] getStpPreview error:', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
