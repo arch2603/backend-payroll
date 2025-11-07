@@ -15,6 +15,8 @@ const UpdateLineSchema = z.object({
   hours: numLike.min(0).max(1000).optional(),
   rate: numLike.min(0).max(1e9).optional(),
   allowance: numLike.min(0).max(1e9).optional(),
+  ot_15_hours: numLike.min(0).max(1000).optional(),
+  ot_20_hours: numLike.min(0).max(1000).optional(),
   tax: numLike.min(0).max(1e9).optional(),
   deductions: numLike.min(0).max(1e9).optional(),       // we'll map this below
   super: numLike.min(0).max(1e9).optional(),
@@ -23,7 +25,7 @@ const UpdateLineSchema = z.object({
 
   if(obj._recalc) return true;
   return Object.keys(obj).some( k => 
-  ['hours', 'rate', 'allowance', 'tax', 'deductions', 'super', 'note'].includes(k)
+  ['hours', 'rate', 'allowance', 'ot_15_hours','ot_20_hours', 'tax', 'deductions', 'super', 'note'].includes(k)
   );
 }, { message: 'No fields to update' });
 
@@ -73,8 +75,8 @@ exports.getCurrentItems = async (req, res) => {
     if (!result) {
       return res.json({ status: 'None', items: [] });
     }
-
-    return res.json({ status: 'Draft', ...result });
+    const status = result.status ?? 'Draft';
+    return res.json( { status, items: result.items ?? [], paging: result.paging });
   } catch (err) {
     console.error('[payRun] getCurrentItems error:', err);
     return res.status(500).json({ message: 'Internal server error' });
@@ -120,7 +122,7 @@ exports.recalculateCurrent = async (req, res) => {
 exports.approveCurrent = async (req, res) => {
   try {
     
-    const result = await payRunService.approveCurrentRun(req.user?.id);
+    const result = await payRunService.approveCurrentRun(req.user?.user_id);
     if (result?.ok === false) {
       return res.status(400).json({ message: result.message });
     }
@@ -166,14 +168,24 @@ exports.updateCurrentItem = async (req, res) => {
 };
 
 exports.updateStatus = async (req, res) => {
+  console.log('[updateStatus] body =', req.body);
   try {
     const { status } = req.body; // expect 'Draft'|'Approved'|'Posted'
     if (!status) return res.status(400).json({ message: 'status required' });
     if (!payRunService?.updateCurrentRunStatus) {
       console.warn('[payRun] updateCurrentRunStatus not implemented; echoing');
       return res.json({ ok: true, status });
-    }
-    const result = await payRunService?.updateCurrentRunStatus?.(status, req.user?.user_id);
+    }  
+    
+    const allowApprovedToDraft = Boolean(
+      req.body.allowApprovedToDraft ??
+      req.body.allowApprovedDraft ??   // <- your earlier payload used this
+      req.body.allowRollback ??        // optional alias if you ever used it
+      false
+    );
+
+    const result = await payRunService?.updateCurrentRunStatus?.(status, req.user?.user_id, { allowApprovedToDraft});
+
     return res.json(result ?? { ok: true, status });
   } catch (err) {
     console.error('[payRun] updateStatus error:', err);

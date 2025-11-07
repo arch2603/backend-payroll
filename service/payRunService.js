@@ -18,6 +18,8 @@ async function recalcLine(client, id) {
       COALESCE(rate,0)                   AS rate,
       COALESCE(allowance,0)              AS allowance,
       COALESCE(tax,0)                    AS tax,
+      COALESCE(ot_15_hours,0)            AS ot_15_hours,
+      COALESCE(ot_20_hours,0)            AS ot_20_hours,                    
       COALESCE("super",0)                AS "super",
       COALESCE(deductions_total,0)    AS deductions_total
     FROM pay_run_items
@@ -27,22 +29,25 @@ async function recalcLine(client, id) {
   if (lineRows.length === 0) return null;
 
   const L = lineRows[0];
-  const gross = Number(L.hours) * Number(L.rate) + Number(L.allowance || 0);
-  // TODO: replace with your real tax/super calc or DB function
+  const base = Number(L.hours) * Number(L.rate);
+  const ot15 = Number(L.ot_15_hours  || 0) *  Number(L.rate || 0)  * 1.5;
+  const ot20 = Number(L.ot_20_hours || 0) * Number(L.rate || 0) * 2;
+  const gross = base + ot15 + ot20 + Number(L.allowance || 0);
   const tax = Number(L.tax || 0);
   const sup = Number(L.super || 0);
   const net = gross - tax - Number(L.deductions_total || 0) - sup;
 
   await client.query(`
     UPDATE pay_run_items
-       SET gross = $2, tax = $3, "super" = $4, net = $5, updated_at = NOW()
+       SET gross = $2, tax = $3, "super" = $4, net = $5, updated_at = NOW()"  
      WHERE id = $1
-  `, [id, gross, tax, sup, net]);
+  `, [id, gross, tax, sup, net, ot15, ot20]);
 
   const { rows: updated } = await client.query(`
     SELECT id as line_id, employee_id, pay_run_id,
            hours, allowance, rate, gross, tax, "super",
-           post_tax_deductions as deductions, net, status
+           post_tax_deductions as deductions, ot_15_hours as "time_half",
+           ot_20_hours as "double_time", net, status
     FROM pay_run_items 
     WHERE id = $1
   `, [id]);
@@ -211,7 +216,7 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
 
     // 2) run for that period
     const { rows: runRows } = await client.query(`
-      SELECT id AS pay_run_id
+      SELECT id AS pay_run_id, status
       FROM pay_runs
       WHERE period_id = $1
       ORDER BY id DESC
@@ -223,6 +228,7 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
     }
 
     const runId = runRows[0].pay_run_id;
+    const runStatus = runRows[0].status;
 
     // 3) count
     const { rows: crows } = await client.query(
@@ -250,6 +256,8 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
         (e.first_name || ' ' || e.last_name) AS employee_name,
         l.rate                                AS hourly_rate,
         l.hours,
+        l.ot_15_hours,
+        l.ot_20_hours,
         l.allowance,
         l.gross,
         l.tax,
@@ -277,6 +285,8 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
       employeeName: r.employee_name,
       hourlyRate: Number(r.hourly_rate ?? 0),
       hours: Number(r.hours ?? 0),
+      ot_15_hours: Number(r.ot_15_hours ?? 0),
+      ot_20_hours: Number(r.ot_20_hours ?? 0),
       allowance: Number(r.allowance ?? 0),
       gross: Number(r.gross ?? 0),
       tax: Number(r.tax ?? 0),
@@ -286,7 +296,7 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
       status: r.status
     }));
 
-    return { items, paging: { search, limit, offset, total } };
+    return { status: runStatus, items, paging: { search, limit, offset, total } };
   } finally {
     client.release();
   }
@@ -384,6 +394,14 @@ async function updateCurrentItem(id, patch, userId) {
       vals.push(patch.rate);
       sets.push(`rate = $${vals.length}`);
     }
+     if (realPatch.ot_15_hours !== undefined) {
+      vals.push(patch.ot_15_hours);
+      sets.push(`ot_15_hours = $${vals.length}`);
+    }
+    if (realPatch.ot_20_hours !== undefined) {
+      vals.push(patch.ot_20_hours);
+      sets.push(`ot_20_hours = $${vals.length}`);
+    }
     if (realPatch.allowance !== undefined) {
       vals.push(patch.allowance);
       sets.push(`allowance = $${vals.length}`);
@@ -434,7 +452,7 @@ async function updateCurrentRunStatus(status, userId, { allowApprovedToDraft = f
     throw new Error(`Unknown target status: ${status}`);
   }
 
-  const allowRollback = allowApprovedToDraft ? `OR r.status = 'Approved' AND $1 = 'Draft'` : '';
+  const allowRollback = allowApprovedToDraft ? `OR (cur.status = 'Approved' AND $1 = 'Draft')` : '';
 
   const sql = `
     WITH cur AS (
@@ -468,7 +486,7 @@ async function updateCurrentRunStatus(status, userId, { allowApprovedToDraft = f
       )
     RETURNING pr.*;`;
 
-  const { rows } = await pool.query(sql, [status, userId || null, allowApprovedToDraft]);
+  const { rows } = await pool.query(sql, [status, userId || null]);
 
   if (rows.length === 0) {
     // Either no current run, or invalid transition
