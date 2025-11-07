@@ -20,7 +20,9 @@ router.get(
   authorizeRoles('admin','hr'),
   payRunCtrl.getCurrentValidation
 );
-//router.get('/current/export/stp-preview', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.getStpPreview);
+
+router.get('/current/export/bank-file', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportBankFile);
+router.get('/current/export/payslips', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportPayslipsPdf);
 
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);

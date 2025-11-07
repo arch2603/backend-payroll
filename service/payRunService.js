@@ -851,6 +851,14 @@ async function getStpPreview() {
   }
 }
 
+async function buildBankCsvForCurrentRun() {
+
+}
+
+async function streamPayslipsPdfForCurrentRun() {
+  
+}
+
 // ---- final exports (no stub overwrite)
 module.exports = {
   getStpPreview,

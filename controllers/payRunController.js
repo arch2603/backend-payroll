@@ -4,7 +4,7 @@ try {
   payRunService = require('../service/payRunService');
 } catch (error) {
   console.warn('[payRun] payRunService not found - using safe fallbacks');
-  console.warn("[payRun] require error was:", error); 
+  console.warn("[payRun] require error was:", error);
   payRunService = null;
 };
 
@@ -23,9 +23,9 @@ const UpdateLineSchema = z.object({
   note: z.string().max(500).optional()
 }).refine(obj => {
 
-  if(obj._recalc) return true;
-  return Object.keys(obj).some( k => 
-  ['hours', 'rate', 'allowance', 'ot_15_hours','ot_20_hours', 'tax', 'deductions', 'super', 'note'].includes(k)
+  if (obj._recalc) return true;
+  return Object.keys(obj).some(k =>
+    ['hours', 'rate', 'allowance', 'ot_15_hours', 'ot_20_hours', 'tax', 'deductions', 'super', 'note'].includes(k)
   );
 }, { message: 'No fields to update' });
 
@@ -76,7 +76,7 @@ exports.getCurrentItems = async (req, res) => {
       return res.json({ status: 'None', items: [] });
     }
     const status = result.status ?? 'Draft';
-    return res.json( { status, items: result.items ?? [], paging: result.paging });
+    return res.json({ status, items: result.items ?? [], paging: result.paging });
   } catch (err) {
     console.error('[payRun] getCurrentItems error:', err);
     return res.status(500).json({ message: 'Internal server error' });
@@ -121,7 +121,7 @@ exports.recalculateCurrent = async (req, res) => {
 
 exports.approveCurrent = async (req, res) => {
   try {
-    
+
     const result = await payRunService.approveCurrentRun(req.user?.user_id);
     if (result?.ok === false) {
       return res.status(400).json({ message: result.message });
@@ -175,8 +175,8 @@ exports.updateStatus = async (req, res) => {
     if (!payRunService?.updateCurrentRunStatus) {
       console.warn('[payRun] updateCurrentRunStatus not implemented; echoing');
       return res.json({ ok: true, status });
-    }  
-    
+    }
+
     const allowApprovedToDraft = Boolean(
       req.body.allowApprovedToDraft ??
       req.body.allowApprovedDraft ??   // <- your earlier payload used this
@@ -184,7 +184,7 @@ exports.updateStatus = async (req, res) => {
       false
     );
 
-    const result = await payRunService?.updateCurrentRunStatus?.(status, req.user?.user_id, { allowApprovedToDraft});
+    const result = await payRunService?.updateCurrentRunStatus?.(status, req.user?.user_id, { allowApprovedToDraft });
 
     return res.json(result ?? { ok: true, status });
   } catch (err) {
@@ -264,6 +264,40 @@ exports.getStpPreview = async (_req, res) => {
   }
 };
 
+exports.exportsBankFile = async (req, res) => {
+  try {
+    if (!payRunService?.buildBankCsvForCurrentRun) {
+      return res.status(501).json({ message: 'Bank export failed' });
+    }
+    const { filename, csv } = await payRunService?.buildBankCsvForCurrentRun();
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Conten-Disposition', `attachment; filename="${filename}"`);
+    return res.send(csv);
+
+  } catch (error) {
+    console.error('[payRun] exportBankFile error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+
+};
+
+exports.exportPayslipsPdf = async (req, res) => {
+   try {
+    if (!payRunService?.streamPayslipsPdfForCurrentRun) {
+      return res.status(501).json({ message: 'Payslips export not implemented' });
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="payslips.pdf"');
+    await payRunService.streamPayslipsPdfForCurrentRun(res);
+  } catch (err) {
+    console.error('[payRun] exportPayslipsPdf error:', err);
+    // If headers already sent, we can’t send JSON; end stream.
+    if (!res.headersSent) {
+      return res.status(500).json({ message: 'Internal server error' });
+    }
+    try { res.end(); } catch(_) {}
+  }
+};
 
 
 
