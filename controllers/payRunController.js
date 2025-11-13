@@ -29,6 +29,8 @@ const UpdateLineSchema = z.object({
   );
 }, { message: 'No fields to update' });
 
+const { resolveRunId } = require('./utils/resolverRunId');
+
 
 function emptySummary() {
   return {
@@ -52,6 +54,7 @@ exports.getCurrentSummary = async (req, res) => {
     }
     // Ensure minimum shape (tolerant to partial service results)
     return res.json({
+      run_id: summary.run_id ?? null,
       status: summary.status ?? 'Draft',
       period: summary.period ?? null,
       totals: ensureTotals(summary.totals),
@@ -88,6 +91,7 @@ exports.getCurrent = async (req, res) => {
     const data = await payRunService?.getCurrentRun?.() ?? null;
     if (!data) return res.json(emptySummary());
     return res.json({
+      run_id: data.run_id ?? null,
       status: data.status ?? 'Draft',
       period: data.period ?? null,
       totals: ensureTotals(data.totals),
@@ -264,40 +268,125 @@ exports.getStpPreview = async (_req, res) => {
   }
 };
 
-exports.exportsBankFile = async (req, res) => {
+exports.exportBankFile = async (req, res) => {
   try {
     if (!payRunService?.buildBankCsvForCurrentRun) {
       return res.status(501).json({ message: 'Bank export failed' });
     }
-    const { filename, csv } = await payRunService?.buildBankCsvForCurrentRun();
+    const runId = req.query.run_id ? Number(req.query.run_id) : null;
+    const { filename, csv } = await payRunService.buildBankCsvForCurrentRun({ runId });
+
+    if (!csv || !csv.length) {
+      return res.status(400).json({ message: 'No rows to export' });
+    }
+
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Conten-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename || 'bank_export.csv'}"`);
     return res.send(csv);
 
   } catch (error) {
-    console.error('[payRun] exportBankFile error:', err);
+    console.error('[payRun] exportBankFile error:', error);
     return res.status(500).json({ message: 'Internal server error' });
   }
 
 };
 
-exports.exportPayslipsPdf = async (req, res) => {
-   try {
+exports.exportPayslipsPdfCurrent = async (req, res, next) => {
+
+  try {
     if (!payRunService?.streamPayslipsPdfForCurrentRun) {
       return res.status(501).json({ message: 'Payslips export not implemented' });
     }
+    const runId = await resolveRunId(req);
+
+    console.log('[pay-runs/export/payslips]',
+      'param.id=', req.params?.id,
+      'query.run_id=', req.query?.run_id,
+      'resolved runId=', runId
+    );
+
+    if (!runId) return res.status(404).json({ message: 'No current run found' });
+
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="payslips.pdf"');
+    res.setHeader('Content-Disposition', `attachment; filename="payslips-run-${runId}.pdf"`);
+
     await payRunService.streamPayslipsPdfForCurrentRun(res);
+
   } catch (err) {
     console.error('[payRun] exportPayslipsPdf error:', err);
-    // If headers already sent, we can’t send JSON; end stream.
     if (!res.headersSent) {
       return res.status(500).json({ message: 'Internal server error' });
     }
-    try { res.end(); } catch(_) {}
+    try { res.end(); } catch (e) {
+      next(e);
+    }
   }
 };
+
+exports.exportPayslipsPdfById = async (req, res, next) => {
+  try {
+    const runId = Number(req.params.id);
+
+    if (!Number.isFinite(runId) || runId <= 0) {
+      return res.status(400).json({ message: 'Invalid Run id' });
+    }
+
+    console.log('[pay-runs/export/payslips]',
+      'param.id=', req.params?.id,
+      'resolved runId=', runId
+    );
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="payslips-run-${runId}.pdf"`);
+
+    await payRunService.streamPayslipsPdfForRunById(runId, res);
+
+  } catch (err) {
+    console.error('[payRun] exportPayslipsPdf error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({ message: 'Internal server error' });
+    }
+    try { res.end(); } catch (e) {
+      next(e);
+    }
+  }
+};
+
+exports.viewPayslipInline = async (req, res, next) => {
+  try {
+    const runId = Number(req.params.runId);
+    const employeeId = Number(req.params.empId);
+
+    if (!Number.isFinite(runId) || runId <= 0) {
+      return res.status(400).json({ message: 'Invalid Run id' });
+    }
+
+    if (!Number.isFinite(employeeId) || employeeId <= 0) {
+      return res.status(400).json({ message: 'Invalid Employee id' });
+    }
+
+    console.log('[pay-runs/export/payslips]',
+      'param.id=', req.params?.id,
+      'resolved runId=', runId
+    );
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="payslips-run-${employeeId}-${runId}.pdf"`);
+
+    await payRunService.viewPayslipInline(runId, employeeId, res);
+
+  } catch (err) {
+    console.error('[payRun] exportPayslipsPdf error:', err);
+    if (!res.headersSent) {
+      return res.status(500).json({ message: 'Internal server error' });
+    }
+    try { res.end(); } catch (e) {
+      next(e);
+    }
+  }
+};
+
+
 
 
 

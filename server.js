@@ -14,19 +14,26 @@ const payRunRoutes = require("./routes/payRunRoutes");
 const payPeriodRoutes = require("./routes/payPeriodRoutes");
 
 
+
 const app = express();
+const db = require('./db');
+app.locals.db = db;
+
 const PORT = process.env.PORT || 5000;
-const ALLOWED_ORIGINS = [
-  "http://localhost:5173",
-  "http://192.168.1.120:3001",
-  "http://192.168.1.100:5173",
-  "http://192.168.1.101:5173", // add your actual Vite origin(s)
-];
+
+// const ALLOWED_ORIGINS = [
+//   "http://localhost:5173",
+//   "http://192.168.1.120:3001",
+//   "http://192.168.1.100:5173",
+//   "http://192.168.1.101:5173", // add your actual Vite origin(s)
+// ];
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS.split(',').map( o => o.trim());
 
 const corsOptions = {
   origin(origin, cb) {
     // allow same-origin tools (curl/postman) and allowed web origins
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
   credentials: true,
