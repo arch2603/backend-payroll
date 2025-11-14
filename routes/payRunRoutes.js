@@ -24,7 +24,7 @@ router.get(
 router.get('/current/export/bank-file', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportBankFile);
 router.get('/:id/export/payslips', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportPayslipsPdfById);
 router.get('/current/export/payslips', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportPayslipsPdfCurrent);
-router.get('/runs/:runId/payslips/:employeedId', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.viewPaySlipInline);
+router.get('/current/:runId/payslip/:employeeId', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.viewPayslipInline);
 
 
 router.post('/current/start', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.startCurrent);

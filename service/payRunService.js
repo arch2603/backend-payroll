@@ -9,7 +9,24 @@ const PDFDocument = require('pdfkit');
 const REMITTER = process.env.BANK_REMITTER_NAME || 'talitrendyfusion';
 const EXPORT_TZ = 'Australia/Brisbane';
 
+const num = (v) => Number(v || 0);
 
+const money = (v) => {
+  const n = Number(v || 0);
+  return n.toLocaleString('en-AU', {
+    style: 'currency',
+    currency: 'AUD',
+    minimumFractionDigits: 2,
+  });
+};
+
+const THEME = {
+  margins: { top: 40, right: 40, bottom: 40, left: 40 },
+  rule: '#CCCCCC',
+  cardRule: '#E6E6E6',
+  textDim: '#555555',
+  draft: '#FF9999',
+};
 
 
 function periodStartSQL(alias = 'pp') {
@@ -1075,30 +1092,6 @@ async function streamPayslipsPdfForCurrentRun(res) {
   }
 }
 
-function payslipTheme()
-{
-    const THEME = {
-    margins: { top: 40, right: 40, bottom: 40, left: 40 },
-    rule: '#CCCCCC',
-    cardRule: '#E6E6E6',
-    textDim: '#444',
-    draft: '#EEEEEE',
-  };
-}
-
-function drawPayslip(doc, data) {
-
-  payslipTheme();
-  const money = (v) => {
-    const n = Number(v || 0);
-    const s = n.toLocaleString('en-AU', { style: 'currency', currency: 'AUD', minimumFractionDigits: 2 });
-    return n < 0 ? `(${s.replace('-', '')})` : s;
-  };
-  const num = (v) => Number(v || 0);
-
-}
-
-
 async function streamPayslipsPdfForRunById(runId, res) {
 
   if (!res) throw new Error('Response stream is required');
@@ -1274,7 +1267,7 @@ async function streamPayslipsPdfForRunById(runId, res) {
 
     function lineItem(label, amount, x, y) {
       const leftWidth = Math.floor(COL_WIDTH * 0.6);
-      doc.fontSize(10).font('Helvetica').text(label, x, y+8, { width: leftWidth });
+      doc.fontSize(10).font('Helvetica').text(label, x, y + 8, { width: leftWidth });
       doc.font('Helvetica').text(money(amount), x + leftWidth + 8, y + 8, { width: COL_WIDTH - leftWidth - 8, align: 'right' });
       return doc.y;
     }
@@ -1424,12 +1417,383 @@ async function streamPayslipsPdfForRunById(runId, res) {
   }
 }
 
-async function viewPayslipInline(runId, empId, res) {
-  
+
+function drawPayslipInLine(doc, data) {
+ 
+  const { run, employee, item } = data;
+
+  const LOGO_PATH = process.env.COMPANY_LOGO_PATH || '';
+  const COMPANY_ABN = process.env.COMPANY_ABN || '';
+  const COMPANY_NAME = process.env.COMPANY_NAME || '';
+  const remitter = (typeof REMITTER !== 'undefined' && REMITTER) ? REMITTER : '';
+
+  const period = `${dayjs(run.period_start).format('DD MMM YYYY')} – ${dayjs(run.period_end).format('DD MMM YYYY')}`;
+  const payDate = run.pay_date ? dayjs(run.pay_date).format('DD MMM YYYY') : null;
+  const curStatus = String(run.status || '').toLowerCase();
+  const isDraft = !['approved', 'posted'].includes(curStatus);
+
+  // --- Layout constants & helpers ---
+  let X_LEFT, X_RIGHT, COL_GAP, COL_LEFT, COL_RIGHT, COL_WIDTH, RULE_COLOR;
+  const SAFE_TOP_CONST = 130;
+
+  function refreshLayoutForCurrentPage() {
+    X_LEFT = doc.page.margins.left;
+    X_RIGHT = doc.page.width - doc.page.margins.right;
+    COL_GAP = 24;
+    COL_LEFT = X_LEFT;
+    COL_RIGHT = X_LEFT + ((X_RIGHT - X_LEFT) / 2) + COL_GAP / 2;
+    COL_WIDTH = ((X_RIGHT - X_LEFT) / 2) - (COL_GAP / 2);
+    RULE_COLOR = THEME.rule;
+  }
+
+  const SAFE_BOTTOM = () => doc.page.height - doc.page.margins.bottom - 50;
+
+  function watermarkDraft() {
+    if (!isDraft) return;
+    const cx = (X_LEFT + X_RIGHT) / 2;
+    const cy = doc.page.height / 2;
+    doc.save()
+      .rotate(-30, { origin: [cx, cy] })
+      .fontSize(80)
+      .fillColor(THEME.draft)
+      .opacity(0.5)
+      .text('DRAFT', cx - 180, cy - 40, { width: 360, align: 'center' })
+      .opacity(1)
+      .fillColor('black')
+      .restore();
+  }
+
+  function drawHeader() {
+    const topY = 40;
+    const headerW = X_RIGHT - X_LEFT;
+    const logoSize = 42;
+
+    if (LOGO_PATH) {
+      try {
+        doc.image(LOGO_PATH, X_LEFT, topY, {
+          width: logoSize,
+          height: logoSize,
+          fit: [logoSize, logoSize],
+        });
+      } catch (_) { /* ignore logo errors */ }
+    }
+
+    const headerX = LOGO_PATH ? X_LEFT + logoSize + 10 : X_LEFT;
+
+    doc
+      .fontSize(16).font('Helvetica-Bold')
+      .text(COMPANY_NAME || ' ', headerX, topY, {
+        width: headerW - (headerX - X_LEFT),
+        align: 'left',
+      });
+
+    doc.moveDown(0.2);
+    doc.fontSize(9).font('Helvetica').fillColor('#444');
+    if (remitter) doc.text(`Remitter: ${remitter}`);
+    if (COMPANY_ABN) doc.text(`ABN: ${COMPANY_ABN}`);
+    doc.fillColor('black');
+
+    const sub = [
+      `Pay Run: #${run.run_id}`,
+      `Status: ${run.status || '—'}`,
+      `Period: ${period}`,
+      ...(payDate ? [`Pay Date: ${payDate}`] : []),
+    ].join('   •   ');
+
+    doc.fontSize(10).text(sub, X_LEFT, doc.y + 4, { width: headerW, align: 'left' });
+
+    doc
+      .moveTo(X_LEFT, doc.y + 6)
+      .lineWidth(0.7)
+      .strokeColor(RULE_COLOR)
+      .lineTo(X_RIGHT, doc.y + 6)
+      .stroke()
+      .strokeColor('black');
+  }
+
+  function drawFooter() {
+    const bottom = doc.page.height - doc.page.margins.bottom;
+    const ts = dayjs().format('DD MMM YYYY HH:mm') + ' AEST';
+    doc.fontSize(9).fillColor('#666')
+      .text(`Generated: ${ts}`, X_LEFT, bottom - 14, {
+        width: (X_RIGHT - X_LEFT) / 2,
+        align: 'left',
+      })
+      .fillColor('black');
+
+    // Single page → page 1 of 1
+    doc.fontSize(9).fillColor('#666')
+      .text(`Page 1 of 1`, X_LEFT + (X_RIGHT - X_LEFT) / 2, bottom - 14, {
+        width: (X_RIGHT - X_LEFT) / 2,
+        align: 'right',
+      })
+      .fillColor('black');
+  }
+
+  function ensureSpace(currentY, need = 40) {
+    // For inline single page we *could* add more pages, but realistically one payslip fits on one page.
+    // If ever needed, you can call doc.addPage() here.
+    if (currentY + need > SAFE_BOTTOM()) {
+      // Optional: doc.addPage(); refreshLayoutForCurrentPage(); drawHeader(); drawFooter();
+      // For now just clamp.
+      return SAFE_BOTTOM() - need;
+    }
+    return currentY;
+  }
+
+  function sectionCard(title, x, y) {
+    const paddingX = 10;
+    const paddingY = 6;
+    const textY = y + paddingY;
+    const boxHeight = 22 + paddingY * 2;
+
+    doc
+      .roundedRect(x - 8, y, COL_WIDTH + 16, boxHeight, 6)
+      .lineWidth(0.6)
+      .strokeColor(THEME.cardRule)
+      .stroke()
+      .strokeColor('black');
+
+    doc
+      .fontSize(11)
+      .font('Helvetica-Bold')
+      .text(title, x + paddingX, textY);
+
+    return y + boxHeight + 4;
+  }
+
+  function lineItem(label, amount, x, y) {
+    const leftWidth = Math.floor(COL_WIDTH * 0.6);
+    doc
+      .fontSize(10)
+      .font('Helvetica')
+      .text(label, x, y + 8, { width: leftWidth });
+
+    doc
+      .font('Helvetica')
+      .text(money(amount), x + leftWidth + 8, y + 8, {
+        width: COL_WIDTH - leftWidth - 8,
+        align: 'right',
+      });
+
+    return doc.y;
+  }
+
+  function drawTotalsPanel(gross, tax, superEmployer, net) {
+    const h = 86;
+    const y0 = doc.y + 10;
+
+    doc
+      .roundedRect(X_LEFT, y0, X_RIGHT - X_LEFT, h, 6)
+      .lineWidth(0.8)
+      .strokeColor(RULE_COLOR)
+      .stroke()
+      .strokeColor('black');
+
+    const left = X_LEFT + 12;
+    const mid = X_LEFT + (X_RIGHT - X_LEFT) / 2;
+    const right = X_RIGHT - 12;
+
+    doc.font('Helvetica-Bold').fontSize(11);
+    doc.text('Gross', left, y0 + 10);
+    doc.text('Tax', left, y0 + 30);
+    doc.text('Super (employer)', left, y0 + 50);
+
+    doc
+      .font('Helvetica-Bold')
+      .text(money(gross), mid, y0 + 10, { width: right - mid, align: 'right' });
+    doc
+      .font('Helvetica')
+      .text(money(tax), mid, y0 + 30, { width: right - mid, align: 'right' });
+    doc
+      .font('Helvetica')
+      .text(money(superEmployer), mid, y0 + 50, {
+        width: right - mid,
+        align: 'right',
+      });
+
+    doc.font('Helvetica-Bold').fontSize(12).text('NET PAY', left, y0 + 68);
+    doc
+      .fontSize(14)
+      .text(money(net), mid, y0 + 66, {
+        width: right - mid,
+        align: 'right',
+      });
+
+    return y0 + h;
+  }
+
+  // --- START PAGE ---
+  refreshLayoutForCurrentPage();
+  watermarkDraft();
+  drawHeader();
+  drawFooter();
+
+  let y = SAFE_TOP_CONST;
+
+  // Employee identity
+  const fullName = `${employee.first_name || ''} ${employee.last_name || ''}`.trim() || 'Employee';
+
+  y = ensureSpace(y, 40);
+  doc
+    .fontSize(12)
+    .font('Helvetica-Bold')
+    .text(fullName, X_LEFT, y, {
+      width: X_RIGHT - X_LEFT,
+      align: 'left',
+    });
+  y = doc.y + 2;
+
+  const idParts = [
+    employee.employee_number ? `Employee #: ${employee.employee_number}` : `Employee ID: ${employee.employee_id}`,
+    employee.email || null,
+  ].filter(Boolean);
+
+  doc
+    .fontSize(10)
+    .fillColor(THEME.textDim)
+    .text(idParts.join('   •   '), X_LEFT, y)
+    .fillColor('black');
+
+  y = doc.y + 8;
+
+  // Two columns (EARNINGS / DEDUCTIONS)
+  let yLeft = sectionCard('EARNINGS', COL_LEFT, y);
+  let yRight = sectionCard('DEDUCTIONS', COL_RIGHT, y);
+
+  const hours = num(item.hours);
+  const rate = num(item.rate || item.effective_hourly_rate);
+  const ot15h = num(item.ot_15_hours);
+  const ot20h = num(item.ot_20_hours);
+  const allowance = num(item.allowance);
+  const payeTax = num(item.tax);
+  const otherDed = num(item.deductions_total || item.deductions);
+  const superEmployer = num(item.super_employer ?? item.super ?? 0);
+
+  const base = hours * rate;
+  if (hours > 0) {
+    yLeft = lineItem(`Base ${hours.toFixed(2)} h × ${money(rate)}`, base, COL_LEFT, yLeft);
+  }
+  if (ot15h > 0) {
+    yLeft = lineItem(
+      `Overtime 1.5   ${ot15h.toFixed(2)} h × ${money(rate)} × 1.5`,
+      ot15h * rate * 1.5,
+      COL_LEFT,
+      yLeft
+    );
+  }
+  if (ot20h > 0) {
+    yLeft = lineItem(
+      `Overtime 2.0   ${ot20h.toFixed(2)} h × ${money(rate)} × 2.0`,
+      ot20h * rate * 2.0,
+      COL_LEFT,
+      yLeft
+    );
+  }
+  if (allowance > 0) {
+    yLeft = lineItem('Allowance', allowance, COL_LEFT, yLeft);
+  }
+
+  yRight = lineItem('Tax (PAYG)', payeTax, COL_RIGHT, yRight);
+  if (otherDed > 0) {
+    yRight = lineItem('Other deductions', otherDed, COL_RIGHT, yRight);
+  }
+
+  // Totals panel
+  doc.y = ensureSpace(Math.max(yLeft, yRight) + 6, 100);
+  const gross = num(item.gross);
+  const net = num(item.net);
+  drawTotalsPanel(gross, payeTax, superEmployer, net);
+
+  // Optional Note
+  if (item.note) {
+    doc.y = ensureSpace(doc.y + 8, 60);
+    const noteTop = doc.y;
+    const noteW = X_RIGHT - X_LEFT;
+    doc
+      .roundedRect(X_LEFT - 6, noteTop - 6, noteW + 12, 50, 6)
+      .lineWidth(0.6)
+      .strokeColor('#EDEDED')
+      .stroke()
+      .strokeColor('black');
+
+    doc.font('Helvetica-Bold').fontSize(10).text('Note', X_LEFT, noteTop);
+    doc
+      .font('Helvetica')
+      .fontSize(10)
+      .text(String(item.note), X_LEFT, doc.y + 2, { width: noteW });
+  }
 }
 
-function money(n) {
-  return (Number(n || 0)).toLocaleString('en-AU', { style: 'currency', currency: 'AUD' });
+async function viewPayslipInline(runId, employeeId, res) {
+  if (!res) throw new Error('Response stream is required');
+
+  if (!Number.isFinite(Number(runId)) || Number(runId) <= 0) {
+    res.status(400).json({ message: 'Invalid run id' });
+    return;
+  }
+
+  const data = await getPayslipData(runId, employeeId);
+
+  const filename = `payslip-run-${data.run.run_id}-emp-${data.employee.employee_number || data.employee.employee_id}.pdf`;
+
+  // Inline (browser preview) instead of attachment
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+
+  const doc = new PDFDocument({
+    size: 'A4',
+    margins: THEME.margins,
+    bufferPages: true,
+  });
+
+  doc.on('error', (err) => {
+    try { res.destroy(err); } catch (_) { }
+  });
+
+  doc.pipe(res);
+
+  drawPayslipInLine(doc, data);
+
+  doc.end();
+
+}
+
+async function getPayslipData(runId, employeeId) {
+  const db = await pool.connect();
+
+  const { rows: runRows } = await db.query(`
+      SELECT r.id as run_id, r.status, p.period_start, p.period_end 
+      FROM pay_runs r
+      JOIN pay_periods p on p.id = r.period_id
+      WHERE r.id = $1` , [runId]);
+
+  if (!runRows.length) throw new Error('Run not found');
+
+
+  const { rows: empRows } = await db.query(
+    `SELECT e.employee_id, e.first_name, e.last_name, e.email,
+            e.employee_number, e.effective_hourly_rate
+       FROM employee e where e.employee_id = $1`,
+    [employeeId]
+  );
+  if (!empRows.length) throw new Error('Employee not found');
+
+
+  const { rows: itemRows } = await db.query(
+    `SELECT i.*
+       FROM pay_run_items i
+      WHERE i.pay_run_id = $1 and i.employee_id = $2`,
+    [runId, employeeId]
+  );
+  if (!itemRows.length) throw new Error('No payslip line for this employee/run');
+
+  return {
+    run: runRows[0],
+    employee: empRows[0],
+    item: itemRows[0],
+  };
 }
 
 function toCsv({ columns, rows }) {
@@ -1463,6 +1827,7 @@ function splitUsableAndWarnings(lines) {
 
 // ---- final exports (no stub overwrite)
 module.exports = {
+  viewPayslipInline,
   getActiveRunId,
   getStpPreview,
   getCurrentRunSummary,

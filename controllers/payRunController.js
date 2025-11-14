@@ -355,7 +355,7 @@ exports.exportPayslipsPdfById = async (req, res, next) => {
 exports.viewPayslipInline = async (req, res, next) => {
   try {
     const runId = Number(req.params.runId);
-    const employeeId = Number(req.params.empId);
+    const employeeId = Number(req.params.employeeId);
 
     if (!Number.isFinite(runId) || runId <= 0) {
       return res.status(400).json({ message: 'Invalid Run id' });
@@ -365,9 +365,10 @@ exports.viewPayslipInline = async (req, res, next) => {
       return res.status(400).json({ message: 'Invalid Employee id' });
     }
 
-    console.log('[pay-runs/export/payslips]',
-      'param.id=', req.params?.id,
-      'resolved runId=', runId
+    console.log('[pay-runs/view-payslip]',
+      'param.id=', req.params?.runId,
+      'resolved runId=', runId,
+      'param.employeeId =', req.params?.employeeId
     );
 
     res.setHeader('Content-Type', 'application/pdf');
