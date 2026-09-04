@@ -5,11 +5,11 @@ const { authenticateToken, authorizeRoles } = require('../middleware/authMiddlew
 const employeeCtrl = require('../controllers/employeeController');
 
 // GET /api/employees?search=&limit=50&offset=0
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, authorizeRoles('admin','hr'), async (req, res) => {
   try {
-    const search = (req.query.search || '').trim();
-    const limit  = Math.min(parseInt(req.query.limit || '50', 10), 200); // hard cap
-    const offset = Math.max(parseInt(req.query.offset || '0', 10), 0);
+    const search = String(req.query.search || '').trim().slice(0, 100);
+    const limit  = Math.min(Math.max(parseInt(req.query.limit || '50', 10) || 50, 1), 200);
+    const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
 
     const where = `
       ($1 = '' OR
@@ -27,7 +27,7 @@ router.get('/', authenticateToken, async (req, res) => {
         e.last_name        AS lastname,
         e.email            AS email,
         e.employee_number  AS "employeeNumber",
-        CASE WHEN COALESCE(e.is_active, TRUE) THEN 'Active' ELSE 'Inactive' END AS status
+        COALESCE(e.is_active, TRUE) AS status
       FROM employee e
       WHERE ${where}
       ORDER BY e.last_name, e.first_name

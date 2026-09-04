@@ -1,8 +1,35 @@
 // routes/historyRoutes.js
 const express = require('express');
-const { authenticateToken } = require('../middleware/authMiddleware');
+const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 const pool = require('../db');
+const payRunService = require('../service/payRunService');
 const router = express.Router();
+const historyAccess = [authenticateToken, authorizeRoles('admin', 'hr')];
+
+router.post('/payslips/:id/print', ...historyAccess, async (req, res, next) => {
+  try {
+    const payslipId = Number(req.params.id);
+    if (!Number.isInteger(payslipId) || payslipId <= 0) {
+      return res.status(400).json({ message: 'Invalid payslip id' });
+    }
+    const { rows } = await pool.query(
+      `SELECT item.pay_run_id, slip.employee_id
+         FROM payslips slip
+         JOIN pay_run_items item ON item.id = slip.pay_run_item_id
+        WHERE slip.id = $1`,
+      [payslipId]
+    );
+    if (!rows.length) return res.status(404).json({ message: 'Payslip not found' });
+
+    res.once('finish', () => {
+      pool.query('UPDATE payslips SET printed_at = now() WHERE id = $1', [payslipId])
+        .catch(error => console.error('[history] unable to record print:', error));
+    });
+    return payRunService.viewPayslipInline(rows[0].pay_run_id, rows[0].employee_id, res);
+  } catch (error) {
+    return next(error);
+  }
+});
 
 // Helper to build WHERE based on filters
 function buildWhere({ employee, from, to, status }) {
@@ -12,11 +39,11 @@ function buildWhere({ employee, from, to, status }) {
     params.push(`%${employee}%`);
     where.push(`(LOWER(e.first_name || ' ' || e.last_name) LIKE LOWER($${params.length}) OR CAST(e.employee_id AS TEXT) LIKE $${params.length})`);
   }
-  if (from) {
+  if (from && /^\d{4}-\d{2}-\d{2}$/.test(from)) {
     params.push(from);
     where.push(`pp.period_start >= $${params.length}`);
   }
-  if (to) {
+  if (to && /^\d{4}-\d{2}-\d{2}$/.test(to)) {
     params.push(to);
     where.push(`pp.period_end <= $${params.length}`);
   }
@@ -29,9 +56,9 @@ function buildWhere({ employee, from, to, status }) {
 }
 
 // GET /api/history/payslips?employee=&from=yyyy-mm-dd&to=yyyy-mm-dd&status=&page=&pageSize=
-router.get('/history/payslips', authenticateToken, async (req, res) => {
-  const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10), 1), 200);
+router.get('/history/payslips', ...historyAccess, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page || '1', 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || '25', 10) || 25, 1), 200);
   const { whereSql, params } = buildWhere(req.query);
   const offset = (page - 1) * pageSize;
 
@@ -55,7 +82,7 @@ router.get('/history/payslips', authenticateToken, async (req, res) => {
 });
 
 // GET /api/history/export.csv?employee=&from=&to=&status=
-router.get('/history/export.csv', authenticateToken, async (req, res) => {
+router.get('/history/export.csv', ...historyAccess, async (req, res) => {
   const { whereSql, params } = buildWhere(req.query);
   const q = await pool.query(
     `SELECT pp.period_start::date, pp.period_end::date,
@@ -92,7 +119,8 @@ router.get('/history/export.csv', authenticateToken, async (req, res) => {
 
 function csvEscape(s) {
   if (s == null) return '';
-  const str = String(s);
+  const raw = String(s);
+  const str = /^[=+\-@]/.test(raw) ? `'${raw}` : raw;
   return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
 }
 function num(n) { return Number(n || 0).toFixed(2); }
