@@ -2,6 +2,7 @@
 const pool = require('../db');
 const bcrypt = require('bcrypt');
 const userService = require('../service/userService')
+const { passwordError, normalizeRole } = require('../service/passwordPolicy');
 
 /**
  * GET /users
@@ -26,12 +27,16 @@ const createUser = async (req, res) => {
   // We can forward to same query as registerUser, but implement here to keep controller focused
   const { username, password, role = 'employee', employee_id = null } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'username & password required' });
+  const invalidPassword = passwordError(password);
+  if (invalidPassword) return res.status(400).json({ message: invalidPassword });
+  const normalizedRole = normalizeRole(role);
+  if (!normalizedRole) return res.status(400).json({ message: 'Invalid role' });
 
   try {
-    const hashed = await require('bcrypt').hash(password, 10);
+    const hashed = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (username, password_hash, role, employee_id) VALUES ($1,$2,$3,$4) RETURNING user_id, username, role, employee_id, created_at',
-      [username, hashed, role, employee_id]
+      [String(username).trim(), hashed, normalizedRole, employee_id]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -43,7 +48,7 @@ const createUser = async (req, res) => {
 
 const updateUser = async (req, res) => {
   try {
-    const userId = Number(req.params.userId);
+    const userId = Number(req.params.id);
     const payload = req.body;
 
     if (!Number.isFinite(userId)) return res.status(400).json({ message: 'Invalid user id' });
@@ -51,13 +56,17 @@ const updateUser = async (req, res) => {
     return res.json(updated);
   } catch (err) {
     console.error('updateUser error', err);
-    res.status(500).json({ message: 'Error updating user' });
+    res.status(err.status || 500).json({ message: err.status ? err.message : 'Error updating user' });
   }
 };
 
 //elete user
 const deleteUser = async (req, res) => {
   const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: 'Invalid user id' });
+  if (id === Number(req.user?.user_id)) {
+    return res.status(409).json({ message: 'You cannot delete your own signed-in account' });
+  }
   try {
     const q = await pool.query('DELETE FROM users WHERE user_id=$1 RETURNING user_id', [id]);
     if (q.rows.length === 0) return res.status(404).json({ message: 'User not found' });
