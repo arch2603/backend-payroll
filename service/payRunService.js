@@ -1,5 +1,4 @@
 require("dotenv").config();
-const { number } = require('zod');
 const pool = require('../db');
 const dayjs = require('dayjs');
 const tz = require('dayjs/plugin/timezone'); dayjs.extend(tz);
@@ -7,20 +6,28 @@ const utc = require('dayjs/plugin/utc'); dayjs.extend(utc);
 const PDFDocument = require('pdfkit');
 const { parse } = require('csv-parse/sync');
 
-const REMITTER = process.env.BANK_REMITTER_NAME || 'talitrendyfusion';
-const EXPORT_TZ = 'Australia/Brisbane';
+const REMITTER = process.env.BANK_REMITTER_NAME || '';
+const EXPORT_TZ = process.env.PAYROLL_TIMEZONE || 'Pacific/Apia';
+const PAYROLL_CURRENCY = process.env.PAYROLL_CURRENCY || 'WST';
 
 const NPF_MEMBER_RATE = Number(process.env.NPF_MEMBER_RATE || '0.10');    // employee 10%
 const NPF_EMPLOYER_RATE = Number(process.env.NPF_EMPLOYER_RATE || '0.10'); // employer 10%
+const ACC_EMPLOYER_RATE = Number(process.env.ACC_EMPLOYER_RATE || '0.01');
+
+for (const [name, rate] of Object.entries({ NPF_MEMBER_RATE, NPF_EMPLOYER_RATE, ACC_EMPLOYER_RATE })) {
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+    throw new Error(`${name} must be a decimal rate between 0 and 1`);
+  }
+}
 
 
 const num = (v) => Number(v || 0);
 
 const money = (v) => {
   const n = Number(v || 0);
-  return n.toLocaleString('en-AU', {
+  return n.toLocaleString('en', {
     style: 'currency',
-    currency: 'AUD',
+    currency: PAYROLL_CURRENCY,
     minimumFractionDigits: 2,
   });
 };
@@ -33,14 +40,6 @@ const THEME = {
   draft: '#FF9999',
 };
 
-
-function periodStartSQL(alias = 'pp') {
-  return `COALESCE(${alias}.start_date, ${alias}.period_start)`;
-}
-
-function periodEndSQL(alias = 'pp') {
-  return `COALESCE(${alias}.end_date, ${alias}.period_end)`;
-}
 
 async function recalcLine(client, id) {
 
@@ -103,11 +102,11 @@ async function recalcLine(client, id) {
         ded,
         gross,
         -- Samoa NPF & ACC contributions (hard-coded rates for now)
-        ROUND(gross * 0.10, 2) AS npf_employee,  -- 10% employee
-        ROUND(gross * 0.10, 2) AS npf_employer,  -- 10% employer
-        ROUND(gross * 0.01, 2) AS acc_employer,  -- 1% employer ACC
+        ROUND(gross * $2, 2) AS npf_employee,
+        ROUND(gross * $3, 2) AS npf_employer,
+        ROUND(gross * $4, 2) AS acc_employer,
         -- NET = gross - tax - other deductions - employee NPF
-        ROUND(gross - tax - ded - (gross * 0.10), 2) AS net
+        ROUND(gross - tax - ded - (gross * $2), 2) AS net
       FROM base_calc
     )
     UPDATE pay_run_items p
@@ -124,6 +123,7 @@ async function recalcLine(client, id) {
       updated_at    = NOW()
     FROM samoan s
     WHERE p.id = s.id
+      AND s.net >= 0
     RETURNING
       p.id AS line_id,
       p.employee_id,
@@ -143,10 +143,15 @@ async function recalcLine(client, id) {
       p.net,
       p.status
     `,
-    [id]
+    [id, NPF_MEMBER_RATE, NPF_EMPLOYER_RATE, ACC_EMPLOYER_RATE]
   );
 
-  return rows[0] ?? null;
+  if (!rows[0]) {
+    const error = new Error(`Deductions exceed gross pay for pay-run item ${id}`);
+    error.status = 400;
+    throw error;
+  }
+  return rows[0];
 }
 
 
@@ -183,19 +188,29 @@ async function recomputeRunSummary(client, runId) {
   };
 }
 
-async function getActiveRunId(client) {
-  // Prefer your view if present
-  try {
-    const v = await client.query(`SELECT pay_run_id FROM v_current_run LIMIT 1`);
-    if (v.rows[0]?.pay_run_id) return v.rows[0].pay_run_id;
-  } catch (error) { }
+async function writeAudit(client, { userId, action, entityType, entityId, beforeData = null, afterData = null }) {
+  await client.query(
+    `INSERT INTO audit_log
+      (user_id, action, target, entity_type, entity_id, before_data, after_data, "timestamp")
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, now())`,
+    [
+      userId || null,
+      action,
+      `${entityType}:${entityId}`,
+      entityType,
+      String(entityId),
+      beforeData ? JSON.stringify(beforeData) : null,
+      afterData ? JSON.stringify(afterData) : null,
+    ]
+  );
+}
 
-  // Fallback by date + status (adjust statuses to your enum)
+async function getActiveRunId(client) {
   const q = await client.query(`
     SELECT r.id AS pay_run_id
     FROM pay_runs r
     JOIN pay_periods pp ON pp.id = r.period_id
-    WHERE CURRENT_DATE BETWEEN ${periodStartSQL()} AND ${periodEndSQL()}
+    WHERE pp.is_current = TRUE
       AND r.status IN ('Draft','Approved','Posted')
     ORDER BY r.updated_at DESC NULLS LAST
     LIMIT 1
@@ -293,6 +308,9 @@ async function getCurrentRunSummary() {
 
 // -------- Controller expects an ARRAY (not {items,paging})
 async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) {
+  search = String(search).trim().slice(0, 100);
+  limit = Math.min(Math.max(Number.parseInt(limit, 10) || 25, 1), 200);
+  offset = Math.max(Number.parseInt(offset, 10) || 0, 0);
   const client = await pool.connect();
   try {
     // 1) current period
@@ -364,6 +382,7 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
         l.npf_employee,
         l.npf_employer,
         l.acc_employer
+        ,l.note
       FROM pay_run_items l
       JOIN employee e ON e.employee_id = l.employee_id
       WHERE l.pay_run_id = $1
@@ -396,6 +415,7 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
       accEmployer: Number(r.acc_employer ?? 0),
       net: Number(r.net ?? 0),
       status: r.status
+      ,note: r.note
     }));
 
     return { status: runStatus, items, paging: { search, limit, offset, total } };
@@ -466,12 +486,12 @@ async function updateCurrentItem(id, patch, userId) {
 
     // ensure the line belongs to the *current* run
     const { rows: chk } = await client.query(`
-      SELECT l.id, l.pay_run_id, r.status
+      SELECT l.*, r.status AS run_status
       FROM pay_run_items l
       JOIN pay_runs r     ON r.id = l.pay_run_id
       JOIN pay_periods pp ON pp.id = r.period_id
       WHERE l.id = $1 
-        AND CURRENT_DATE BETWEEN pp.period_start AND pp.period_end
+        AND pp.is_current = TRUE
         AND r.status IN ('Draft')
       FOR UPDATE
     `, [id]);
@@ -516,10 +536,6 @@ async function updateCurrentItem(id, patch, userId) {
       vals.push(patch.deductions);
       sets.push(`deductions_total = $${vals.length}`);
     }
-    if (realPatch.super !== undefined) {
-      vals.push(patch.super);
-      sets.push(`super = $${vals.length}`);
-    }
     if (realPatch.note !== undefined) {
       vals.push(patch.note);
       sets.push(`note = $${vals.length}`);
@@ -536,6 +552,15 @@ async function updateCurrentItem(id, patch, userId) {
     const updatedLine = await recalcLine(client, id);
     const summary = await recomputeRunSummary(client, runId);
 
+    await writeAudit(client, {
+      userId,
+      action: _recalc ? 'PAY_RUN_ITEM_RECALCULATED' : 'PAY_RUN_ITEM_UPDATED',
+      entityType: 'pay_run_item',
+      entityId: id,
+      beforeData: chk[0],
+      afterData: updatedLine,
+    });
+
     await client.query('COMMIT');
     return { line: updatedLine, summary };
   } catch (e) {
@@ -546,121 +571,42 @@ async function updateCurrentItem(id, patch, userId) {
   }
 }
 
-// Align with controller: (status, userId)
-async function updateCurrentRunStatus(status, userId, { allowApprovedToDraft = false } = {}) {
-
-  const allowedTargets = new Set(['Draft', 'Approved', 'Posted']);
-  if (!allowedTargets.has(status)) {
-    throw new Error(`Unknown target status: ${status}`);
-  }
-
-  const allowRollback = allowApprovedToDraft ? `OR (cur.status = 'Approved' AND $1 = 'Draft')` : '';
-
-  const sql = `
-    WITH cur AS (
-      SELECT r.id, r.status
-      FROM pay_runs r
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE pp.is_current = TRUE
-      ORDER BY r.created_at DESC
-      LIMIT 1
-    )
-    UPDATE pay_runs pr
-    SET
-      status = $1,
-      approved_by = CASE
-        WHEN $1 = 'Approved' THEN $2
-        WHEN pr.status = 'Approved' AND $1 <> 'Approved' THEN NULL
-        ELSE approved_by
-      END,
-      approved_at = CASE
-        WHEN $1 = 'Approved' THEN NOW()
-        WHEN pr.status = 'Approved' AND $1 <> 'Approved' THEN NULL
-        ELSE approved_at
-      END
-    FROM cur
-    WHERE pr.id = cur.id
-      AND (
-        pr.status = $1                               
-        OR (pr.status = 'Draft' AND $1 = 'Approved') 
-        OR (pr.status = 'Approved' AND $1 = 'Posted')
-        ${allowRollback}                            
-      )
-    RETURNING pr.*;`;
-
-  const { rows } = await pool.query(sql, [status, userId || null]);
-
-  if (rows.length === 0) {
-    // Either no current run, or invalid transition
-    // Fetch current to produce a precise error
-    const { rows: curRows } = await pool.query(`
-      SELECT r.id, r.status
-      FROM pay_runs r
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE pp.is_current = TRUE
-      ORDER BY r.created_at DESC
-      LIMIT 1
-    `);
-
-    if (!curRows.length) return null; // no current period/run
-
-    const cur = curRows[0];
-    throw new Error(
-      `Invalid transition ${cur.status} → ${status}. Allowed: ` +
-      (allowApprovedToDraft
-        ? `Draft→Approved, Approved→Posted, Approved→Draft, or no-op.`
-        : `Draft→Approved, Approved→Posted, or no-op.`)
-    );
-  }
-
-  return rows[0];
-}
-
 async function startForPeriod(periodId, userId = null) {
   const client = await pool.connect();
   try {
-
+    await client.query('BEGIN');
     const { rows: p } = await client.query(`SELECT id FROM pay_periods WHERE id = $1`,
       [periodId]);
 
     if (!p.length) throw new Error("Period not found");
 
-    // check if a run already exists for this period
-    const { rows: existing } = await client.query(
-      `SELECT id FROM pay_runs WHERE period_id = $1 LIMIT 1`,
-      [periodId]
-    );
-
-    if (existing.length) {
-      return existing[0];
-    }
-
     const { rows } = await client.query(
       `INSERT INTO pay_runs (period_id, status, created_by, created_at)
-     VALUES ($1, 'Draft', $2, now())
-     RETURNING id, period_id, status, created_at`,
+       VALUES ($1, 'Draft', $2, now())
+       ON CONFLICT (period_id) DO UPDATE
+         SET period_id = EXCLUDED.period_id
+       RETURNING id, period_id, status, created_at`,
       [periodId, userId]
     );
+
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_ENSURED_FOR_PERIOD',
+      entityType: 'pay_run',
+      entityId: rows[0].id,
+      afterData: rows[0],
+    });
+    await client.query('COMMIT');
     return rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
   } finally {
     client.release();
   }
 }
 
-async function validateCurrentRun() {
-  const client = await pool.connect();
-
-  try {
-    const period = await getCurrentPeriod(client);
-    if (!period) {
-      return { ok: false, errors: ['NO current period found'] };
-    }
-
-    const run = await getCurrentRunRow(client, period.id);
-    if (!run) {
-      return { ok: false, errors: ['No pay run started for current period'] };
-    }
-
+async function validateRunWithClient(client, run) {
     const { rows: items } = await client.query(`
       SELECT pri.*, e.hourly_rate 
       FROM pay_run_items pri
@@ -687,6 +633,23 @@ async function validateCurrentRun() {
       ok: errors.length === 0,
       errors,
     };
+}
+
+async function validateCurrentRun() {
+  const client = await pool.connect();
+
+  try {
+    const period = await getCurrentPeriod(client);
+    if (!period) {
+      return { ok: false, errors: ['No current period found'] };
+    }
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (!run) {
+      return { ok: false, errors: ['No pay run started for current period'] };
+    }
+
+    return validateRunWithClient(client, run);
 
   } finally {
     client.release();
@@ -711,12 +674,13 @@ async function getCurrentRunRow(client, periodId) {
     SELECT id, status FROM pay_runs
     WHERE period_id = $1
     ORDER BY id DESC
-    LIMIT 1  
+    LIMIT 1
+    FOR UPDATE
   `, [periodId]);
   return rows[0] || null;
 }
 
-async function addCurrentRunItem(payload) {
+async function addCurrentRunItem(payload, userId = null) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -775,6 +739,13 @@ async function addCurrentRunItem(payload) {
     const finalLine = finalRows[0];
 
     await recomputeRunSummary(client, run.id);
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_ITEM_CREATED',
+      entityType: 'pay_run_item',
+      entityId: finalLine.id,
+      afterData: finalLine,
+    });
     await client.query('COMMIT');
     return finalLine;
   } catch (err) {
@@ -788,25 +759,35 @@ async function addCurrentRunItem(payload) {
 async function startCurrentRun(userId = null) {
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const period = await getCurrentPeriod(client);
     if (!period) throw new Error('No current period');
-
-    const run = await getCurrentRunRow(client, period.id);
-    if (run) return run;
 
     const { rows } = await client.query(`
       INSERT INTO pay_runs (period_id, status, created_by, created_at)
       VALUES ($1, 'Draft', $2, NOW())
+      ON CONFLICT (period_id) DO UPDATE
+        SET period_id = EXCLUDED.period_id
       RETURNING id, period_id, status
       `, [period.id, userId]);
-
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_ENSURED',
+      entityType: 'pay_run',
+      entityId: rows[0].id,
+      afterData: rows[0],
+    });
+    await client.query('COMMIT');
     return rows[0];
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
   } finally {
     client.release();
   }
 }
 
-async function recalcCurrentRun() {
+async function recalcCurrentRun(userId = null) {
   const client = await pool.connect();
 
   try {
@@ -817,6 +798,14 @@ async function recalcCurrentRun() {
       return { ok: false, message: 'No active run' };
     }
 
+    const { rows: runRows } = await client.query(
+      `SELECT status FROM pay_runs WHERE id = $1 FOR UPDATE`,
+      [runId]
+    );
+    if (runRows[0]?.status !== 'Draft') {
+      throw new Error('Only a Draft pay run can be recalculated');
+    }
+
     const { rows: lines } = await client.query(`
       SELECT id FROM pay_run_items WHERE pay_run_id = $1
       `, [runId]);
@@ -825,6 +814,13 @@ async function recalcCurrentRun() {
       await recalcLine(client, row.id);
     }
     const summary = await recomputeRunSummary(client, runId);
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_RECALCULATED',
+      entityType: 'pay_run',
+      entityId: runId,
+      afterData: summary,
+    });
     await client.query('COMMIT');
     return { ok: true, run_id: runId, ...summary };
   } catch (error) {
@@ -837,7 +833,6 @@ async function recalcCurrentRun() {
 
 async function approveCurrentRun(userId = null) {
   const client = await pool.connect();
-  // console.log("[approveCurrentRun] from:", JSON.stringify(fromStatus), "to:", toStatus);
   try {
     await client.query('BEGIN');
 
@@ -849,11 +844,11 @@ async function approveCurrentRun(userId = null) {
 
     if (run.status !== 'Draft') {
       const msg = `Cannot approve a run with status "${run.status}". Only Draft runs can be approved.`;
-      console.warn('[payRun] approve blocked:', msg);
+      await client.query('ROLLBACK');
       return { ok: false, message: msg };
     }
 
-    const v = await validateCurrentRun();
+    const v = await validateRunWithClient(client, run);
     if (!v.ok) {
       throw new Error('Validation failed: ' + v.errors.join(';'));
     }
@@ -867,41 +862,122 @@ async function approveCurrentRun(userId = null) {
       RETURNING *;
       `, [userId, run.id]);
 
+    await client.query(
+      `INSERT INTO payslips (pay_run_item_id, employee_id, period_id, created_at)
+       SELECT item.id, item.employee_id, $2, now()
+       FROM pay_run_items item
+       WHERE item.pay_run_id = $1
+       ON CONFLICT (pay_run_item_id) DO NOTHING`,
+      [run.id, period.id]
+    );
+
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_APPROVED',
+      entityType: 'pay_run',
+      entityId: run.id,
+      beforeData: { status: run.status },
+      afterData: { status: 'Approved' },
+    });
     await client.query('COMMIT');
-    return { rows: rows[0], ok: true, message: 'Run approved successfully' };
+    return { run: rows[0], ok: true, message: 'Run approved successfully' };
   } catch (error) {
     await client.query('ROLLBACK');
-    throw error
-  }
-}
-
-async function postCurrentRun(userId = null) {
-  const client = await pool.connect();
-  try {
-    const runId = await getActiveRunId(client);
-    if (!runId) throw new Error('No active run');
-
-    const { rows } = await client.query(`
-        SELECT status FROM pay_runs WHERE id = $1
-      `, [runId]);
-
-    const currentStatus = rows[0]?.status;
-
-    if (currentStatus !== 'Approved') { throw new Error('Run must be Approved before it can be posted') }
-
-    return updateCurrentRunStatus('Posted', userId);
+    throw error;
   } finally {
     client.release();
   }
 }
 
-async function deleteCurrentItem(id) {
+async function transitionCurrentRun({ expectedStatus, targetStatus, userId, action }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const period = await getCurrentPeriod(client);
+    if (!period) throw new Error('No current period');
+
+    const run = await getCurrentRunRow(client, period.id);
+    if (!run) throw new Error('No current pay run');
+    if (run.status !== expectedStatus) {
+      throw new Error(`Run must be ${expectedStatus} before it can become ${targetStatus}`);
+    }
+
+    if (targetStatus === 'Draft') {
+      const { rows: distributed } = await client.query(
+        `SELECT count(*)::int AS count
+         FROM payslips slip
+         JOIN pay_run_items item ON item.id = slip.pay_run_item_id
+         WHERE item.pay_run_id = $1
+           AND (slip.printed_at IS NOT NULL OR slip.emailed_at IS NOT NULL)`,
+        [run.id]
+      );
+      if (distributed[0].count > 0) {
+        throw new Error('A distributed payslip exists; this pay run cannot be reopened');
+      }
+      await client.query(
+        `DELETE FROM payslips
+         WHERE pay_run_item_id IN (
+           SELECT id FROM pay_run_items WHERE pay_run_id = $1
+         )`,
+        [run.id]
+      );
+    }
+
+    const { rows } = await client.query(
+      `UPDATE pay_runs
+          SET status = $1,
+              approved_by = CASE WHEN $1 = 'Draft' THEN NULL ELSE approved_by END,
+              approved_at = CASE WHEN $1 = 'Draft' THEN NULL ELSE approved_at END,
+              posted_by = CASE WHEN $1 = 'Posted' THEN $2 ELSE NULL END,
+              posted_at = CASE WHEN $1 = 'Posted' THEN now() ELSE NULL END
+        WHERE id = $3
+        RETURNING *`,
+      [targetStatus, userId || null, run.id]
+    );
+
+    await writeAudit(client, {
+      userId,
+      action,
+      entityType: 'pay_run',
+      entityId: run.id,
+      beforeData: { status: expectedStatus },
+      afterData: { status: targetStatus },
+    });
+    await client.query('COMMIT');
+    return { ok: true, run: rows[0] };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function postCurrentRun(userId = null) {
+  return transitionCurrentRun({
+    expectedStatus: 'Approved',
+    targetStatus: 'Posted',
+    userId,
+    action: 'PAY_RUN_POSTED',
+  });
+}
+
+async function reopenCurrentRun(userId = null) {
+  return transitionCurrentRun({
+    expectedStatus: 'Approved',
+    targetStatus: 'Draft',
+    userId,
+    action: 'PAY_RUN_REOPENED',
+  });
+}
+
+async function deleteCurrentItem(id, userId = null) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     // find the line + run
     const { rows } = await client.query(`
-      SELECT l.pay_run_id, r.status
+      SELECT l.*, r.status AS run_status
       FROM pay_run_items l
       JOIN pay_runs r ON r.id = l.pay_run_id
       WHERE l.id = $1
@@ -913,13 +989,20 @@ async function deleteCurrentItem(id) {
       return { ok: true }; // already gone
     }
 
-    const { pay_run_id, status } = rows[0];
-    if (status !== 'Draft') {
+    const { pay_run_id, run_status: runStatus } = rows[0];
+    if (runStatus !== 'Draft') {
       throw new Error('Run not in Draft, cannot delete item');
     }
 
     await client.query(`DELETE FROM pay_run_items WHERE id = $1`, [id]);
     await recomputeRunSummary(client, pay_run_id);
+    await writeAudit(client, {
+      userId,
+      action: 'PAY_RUN_ITEM_DELETED',
+      entityType: 'pay_run_item',
+      entityId: id,
+      beforeData: rows[0],
+    });
     await client.query('COMMIT');
     return { ok: true };
   } catch (err) {
@@ -973,6 +1056,13 @@ async function buildBankCsvForCurrentRun({ runId: explicitRunId } = {}) {
     const { meta, lines } = await getRunMetaAndLinesForBank(client, runId);
 
     if (!meta) return { filename: 'bank.csv', csv: '', warnings: ['No such run'] };
+    if (!['Approved', 'Posted'].includes(meta.status)) {
+      return {
+        filename: `bank-run-${meta.run_id}.csv`,
+        csv: '',
+        warnings: ['Bank exports require an Approved or Posted pay run'],
+      };
+    }
 
     const { usable, warnings } = splitUsableAndWarnings(lines);
 
@@ -991,67 +1081,6 @@ async function buildBankCsvForCurrentRun({ runId: explicitRunId } = {}) {
 
     const csv = toCsv({ columns, rows });
     return { filename: `bank-run-${meta.run_id}.csv`, csv, warnings };
-  } finally {
-    client.release();
-  }
-}
-
-async function buildSuperCsvForCurrentRun({ runId=null } = {}) {
-  const client = await pool.connect();
-  try {
-    const activeRunId = runId ?? (await getActiveRunId(client));
-
-    if (!activeRunId) {
-      return { filename: 'super-file.csv', csv: '', warnings: ['No active pay run found'] };
-    }
-  
- 
-    const {rows: metaRows} = await client.query(`
-      SELECT r.id as run_id, r.status,
-             pp.period_start, pp.period_end
-      FROM pay_runs r
-      JOIN pay_periods pp ON pp.id = r.period_id
-      WHERE r.id = $1
-      LIMIT 1
-    `, [activeRunId]);
-
-    const meta = metaRows[0];
-
-    if (!meta) {
-      return { filename: 'super-file.csv', csv: '', warnings: ['Pay run not found'] };
-    } 
-
-
-    const {rows}= await client.query(`
-      SELECT 
-        e.employee_id, e.first_name, e.last_name,
-        bank_pick.bsb,
-        bank_pick.account_number,
-        COALESCE(l.npf_employee,0) AS npf_employee,
-        COALESCE(l.npf_employer,0) AS npf_employer,
-        COALESCE(l.acc_employer,0) AS acc_employer
-      FROM pay_run_items l
-      JOIN employee e ON e.employee_id = l.employee_id
-      WHERE l.pay_run_id = $1
-      ORDER BY e.last_name, e.first_name, l.id
-    `, [activeRunId]);
-    
-    const columns = ['employee_id', 'first_name', 'last_name', 'bsb', 'account_number', 'npf_employee_cents', 'npf_employer_cents', 'acc_employer_cents', 'total_contribution_cents'];
-
-    const csvRows = rows.map(r => ({
-      employee_id: r.employee_id,
-      employee_name: `${r.first_name} ${r.last_name}`.trim() ,
-      period_start: meta.period_start,
-      period_end: meta.period_end,
-      gross: Number(r.gross).toFixed(2),
-      npf_employee: Number(r.npf_employee).toFixed(2),
-      npf_employer: Number(r.npf_employer).toFixed(2),
-      acc_employer: Number(r.acc_employer).toFixed(2),
-      total_contribution: (Number(r.npf_employee) + Number(r.npf_employer) + Number(r.acc_employer)).toFixed(2),
-    }));
-
-    const csv = toCsv({ columns, rows: csvRows });
-    return { filename: `super-run-${meta.run_id}.csv`, csv, warnings };
   } finally {
     client.release();
   }
@@ -1150,7 +1179,9 @@ async function getRunMetaAndLinesForPayslips(client, runId) {
     SELECT 
       l.id as line_id,
       e.employee_id, e.first_name, e.last_name,
-      e.email,
+      e.email, e.employee_number, e.position,
+      bank_pick.bsb AS bank_bsb,
+      bank_pick.account_number AS bank_account,
       COALESCE(l.hours,0)        as hours,
       COALESCE(l.rate,0)         as rate,
       COALESCE(l.ot_15_hours,0)  as ot_15_hours,
@@ -1167,6 +1198,14 @@ async function getRunMetaAndLinesForPayslips(client, runId) {
       l.note
     FROM pay_run_items l
     JOIN employee e ON e.employee_id = l.employee_id
+    LEFT JOIN LATERAL (
+      SELECT ebc.bsb, ebc.account_number
+      FROM employee_bank_accounts ebc
+      WHERE ebc.employee_id = e.employee_id
+        AND ebc.is_active
+      ORDER BY ebc.is_primary DESC, ebc.id
+      LIMIT 1
+    ) bank_pick ON TRUE
     WHERE l.pay_run_id = $1
     ORDER BY e.last_name, e.first_name, l.id
   `, [runId]);
@@ -1213,11 +1252,6 @@ async function streamPayslipsPdfForRunById(runId, res) {
   try {
 
     const { meta, lines } = await getRunMetaAndLinesForPayslips(client, runId);
-    console.log('[payslips] run', runId,
-      'js-sum-hours=', lines.reduce((t, r) => t + Number(r.hours || 0), 0),
-      'rows=', lines.length
-    );
-
     if (!meta) {
       res.status(404).json({ message: `Run ${runId} not found` });
       return;
@@ -1327,7 +1361,7 @@ async function streamPayslipsPdfForRunById(runId, res) {
 
     function drawFooter() {
       const bottom = doc.page.height - doc.page.margins.bottom;
-      const ts = dayjs().format('DD MMM YYYY HH:mm') + ' AEST';
+      const ts = `${dayjs().tz(EXPORT_TZ).format('DD MMM YYYY HH:mm')} ${EXPORT_TZ}`;
       const range = doc.bufferedPageRange(); // { start, count }
       doc.fontSize(9).fillColor('#666')
         .text(`Generated: ${ts}`, X_LEFT, bottom - 14, { width: (X_RIGHT - X_LEFT) / 2, align: 'left' })
@@ -1379,8 +1413,8 @@ async function streamPayslipsPdfForRunById(runId, res) {
       return doc.y;
     }
 
-    function drawTotalsPanel(gross, tax, superEmployer, accEmployer, net) {
-      const h = 86;
+    function drawTotalsPanel(gross, tax, npfEmployee, otherDeductions, net) {
+      const h = 112;
       const y0 = doc.y + 10;
       doc.roundedRect(X_LEFT, y0, X_RIGHT - X_LEFT, h, 6).lineWidth(0.8).strokeColor(RULE_COLOR).stroke().strokeColor('black');
 
@@ -1391,16 +1425,15 @@ async function streamPayslipsPdfForRunById(runId, res) {
       doc.font('Helvetica-Bold').fontSize(11);
       doc.text('Gross', left, y0 + 10);
       doc.text('Tax', left, y0 + 30);
-      doc.text('NPF', left, y0 + 50);
-      doc.text('ACC', left, y0 + 80);
+      doc.text('NPF (employee)', left, y0 + 50);
+      doc.text('Other deductions', left, y0 + 70);
+      doc.text('NET PAY', left, y0 + 92);
 
       doc.font('Helvetica-Bold').text(money(gross), mid, y0 + 10, { width: right - mid, align: 'right' });
       doc.font('Helvetica').text(money(tax), mid, y0 + 30, { width: right - mid, align: 'right' });
-      doc.font('Helvetica').text(money(superEmployer), mid, y0 + 50, { width: right - mid, align: 'right' });
-      doc.font('Helvetica').text(money(accEmployer), mid, y0 + 50 + 30, { width: right - mid, align: 'right' });
-
-      doc.font('Helvetica-Bold').fontSize(12).text('NET PAY', left, y0 + 68);
-      doc.fontSize(14).text(money(net), mid, y0 + 66, { width: right - mid, align: 'right' });
+      doc.font('Helvetica').text(money(npfEmployee), mid, y0 + 50, { width: right - mid, align: 'right' });
+      doc.text(money(otherDeductions), mid, y0 + 70, { width: right - mid, align: 'right' });
+      doc.font('Helvetica-Bold').fontSize(14).text(money(net), mid, y0 + 90, { width: right - mid, align: 'right' });
 
       return y0 + h;
     }
@@ -1463,7 +1496,6 @@ async function streamPayslipsPdfForRunById(runId, res) {
       const npfEmployee = num(r.npf_employee ?? r.super ?? 0); // employee NPF
       const npfEmployer = num(r.npf_employer ?? 0);            // employer NPF
       const accEmployer = num(r.acc_employer ?? 0);            // employer ACC
-      const npfEmployeeTotal = npfEmployee + npfEmployer;
 
       const base = hours * rate;
       if (hours > 0) yLeft = lineItem(`Base ${hours.toFixed(2)} h × ${money(rate)}`, base, COL_LEFT, yLeft);
@@ -1473,8 +1505,8 @@ async function streamPayslipsPdfForRunById(runId, res) {
 
       yRight = lineItem('Tax (PAYE)', payeTax, COL_RIGHT, yRight);
 
-      if (npfEmployeeTotal > 0) {
-        yRight = lineItem('NPF (employee, 10%)', npfEmployeeTotal, COL_RIGHT, yRight);
+      if (npfEmployee > 0) {
+        yRight = lineItem('NPF (employee)', npfEmployee, COL_RIGHT, yRight);
       }
 
       if (otherDed > 0) {
@@ -1486,7 +1518,19 @@ async function streamPayslipsPdfForRunById(runId, res) {
       doc.y = ensureSpace(Math.max(yLeft, yRight) + 6, 100);
       const gross = num(r.gross);
       const net = num(r.net);
-      drawTotalsPanel(gross, payeTax, npfEmployeeTotal, accEmployer, net);
+      doc.y = drawTotalsPanel(gross, payeTax, npfEmployee, otherDed, net);
+
+      if (npfEmployer > 0 || accEmployer > 0) {
+        doc.y = ensureSpace(doc.y + 8, 55);
+        doc.font('Helvetica-Bold').fontSize(10)
+          .text('Employer contributions (not deducted from net pay)', X_LEFT, doc.y);
+        if (npfEmployer > 0) {
+          doc.font('Helvetica').text(`NPF employer: ${money(npfEmployer)}`, X_LEFT, doc.y + 3);
+        }
+        if (accEmployer > 0) {
+          doc.font('Helvetica').text(`ACC employer: ${money(accEmployer)}`, X_LEFT, doc.y + 3);
+        }
+      }
 
       // Optional YTD block
       if (r.ytd) {
@@ -1531,7 +1575,9 @@ async function streamPayslipsPdfForRunById(runId, res) {
         res.status(500).json({ message: 'Failed to generate payslips PDF' });
       } catch { }
     }
-    try { stopStreaming && stopStreaming(); } catch { }
+    console.error('[payslips] generation failed:', err);
+  } finally {
+    client.release();
   }
 }
 
@@ -1631,7 +1677,7 @@ function drawPayslipInLine(doc, data) {
 
   function drawFooter() {
     const bottom = doc.page.height - doc.page.margins.bottom;
-    const ts = dayjs().format('DD MMM YYYY HH:mm') + ' AEST';
+    const ts = `${dayjs().tz(EXPORT_TZ).format('DD MMM YYYY HH:mm')} ${EXPORT_TZ}`;
     doc.fontSize(9).fillColor('#666')
       .text(`Generated: ${ts}`, X_LEFT, bottom - 14, {
         width: (X_RIGHT - X_LEFT) / 2,
@@ -1697,8 +1743,8 @@ function drawPayslipInLine(doc, data) {
     return doc.y;
   }
 
-  function drawTotalsPanel(gross, tax, superEmployer, net) {
-    const h = 86;
+  function drawTotalsPanel(gross, tax, npfEmployee, otherDeductions, net) {
+    const h = 112;
     const y0 = doc.y + 10;
 
     doc
@@ -1715,7 +1761,9 @@ function drawPayslipInLine(doc, data) {
     doc.font('Helvetica-Bold').fontSize(11);
     doc.text('Gross', left, y0 + 10);
     doc.text('Tax', left, y0 + 30);
-    doc.text('Super (employer)', left, y0 + 50);
+    doc.text('NPF (employee)', left, y0 + 50);
+    doc.text('Other deductions', left, y0 + 70);
+    doc.text('NET PAY', left, y0 + 92);
 
     doc
       .font('Helvetica-Bold')
@@ -1725,15 +1773,18 @@ function drawPayslipInLine(doc, data) {
       .text(money(tax), mid, y0 + 30, { width: right - mid, align: 'right' });
     doc
       .font('Helvetica')
-      .text(money(superEmployer), mid, y0 + 50, {
+      .text(money(npfEmployee), mid, y0 + 50, {
         width: right - mid,
         align: 'right',
       });
-
-    doc.font('Helvetica-Bold').fontSize(12).text('NET PAY', left, y0 + 68);
+    doc.font('Helvetica').text(money(otherDeductions), mid, y0 + 70, {
+      width: right - mid,
+      align: 'right',
+    });
     doc
+      .font('Helvetica-Bold')
       .fontSize(14)
-      .text(money(net), mid, y0 + 66, {
+      .text(money(net), mid, y0 + 90, {
         width: right - mid,
         align: 'right',
       });
@@ -1790,8 +1841,6 @@ function drawPayslipInLine(doc, data) {
   const npfEmployer = num(item.npf_employer ?? 0);
   const accEmployer = num(item.acc_employer ?? 0);
 
-  npfTotal = npfEmployee + npfEmployer;
-
   const base = hours * rate;
   if (hours > 0) {
     yLeft = lineItem(`Base ${hours.toFixed(2)} h × ${money(rate)}`, base, COL_LEFT, yLeft);
@@ -1817,8 +1866,8 @@ function drawPayslipInLine(doc, data) {
   }
 
   yRight = lineItem('Tax (PAYG)', payeTax, COL_RIGHT, yRight);
-  if(npfTotal > 0 ) {
-    yRight = lineItem('NPF (employee, 10%', npfEmployee, COL_RIGHT, yRight);
+  if (npfEmployee > 0) {
+    yRight = lineItem('NPF (employee)', npfEmployee, COL_RIGHT, yRight);
   }
   if (otherDed > 0) {
     yRight = lineItem('Other deductions', otherDed, COL_RIGHT, yRight);
@@ -1828,7 +1877,19 @@ function drawPayslipInLine(doc, data) {
   doc.y = ensureSpace(Math.max(yLeft, yRight) + 6, 100);
   const gross = num(item.gross);
   const net = num(item.net);
-  drawTotalsPanel(gross, payeTax, npfTotal, net);
+  doc.y = drawTotalsPanel(gross, payeTax, npfEmployee, otherDed, net);
+
+  if (npfEmployer > 0 || accEmployer > 0) {
+    doc.y = ensureSpace(doc.y + 8, 55);
+    doc.font('Helvetica-Bold').fontSize(10)
+      .text('Employer contributions (not deducted from net pay)', X_LEFT, doc.y);
+    if (npfEmployer > 0) {
+      doc.font('Helvetica').text(`NPF employer: ${money(npfEmployer)}`, X_LEFT, doc.y + 3);
+    }
+    if (accEmployer > 0) {
+      doc.font('Helvetica').text(`ACC employer: ${money(accEmployer)}`, X_LEFT, doc.y + 3);
+    }
+  }
 
   // Optional Note
   if (item.note) {
@@ -1887,43 +1948,45 @@ async function viewPayslipInline(runId, employeeId, res) {
 
 async function getPayslipData(runId, employeeId) {
   const db = await pool.connect();
-
-  const { rows: runRows } = await db.query(`
+  try {
+    const { rows: runRows } = await db.query(`
       SELECT r.id as run_id, r.status, p.period_start, p.period_end 
       FROM pay_runs r
       JOIN pay_periods p on p.id = r.period_id
       WHERE r.id = $1` , [runId]);
 
-  if (!runRows.length) throw new Error('Run not found');
+    if (!runRows.length) throw new Error('Run not found');
 
-
-  const { rows: empRows } = await db.query(
-    `SELECT e.employee_id, e.first_name, e.last_name, e.email,
+    const { rows: empRows } = await db.query(
+      `SELECT e.employee_id, e.first_name, e.last_name, e.email,
             e.employee_number, e.effective_hourly_rate
        FROM employee e where e.employee_id = $1`,
-    [employeeId]
-  );
-  if (!empRows.length) throw new Error('Employee not found');
+      [employeeId]
+    );
+    if (!empRows.length) throw new Error('Employee not found');
 
-
-  const { rows: itemRows } = await db.query(
-    `SELECT i.*
+    const { rows: itemRows } = await db.query(
+      `SELECT i.*
        FROM pay_run_items i
       WHERE i.pay_run_id = $1 and i.employee_id = $2`,
-    [runId, employeeId]
-  );
-  if (!itemRows.length) throw new Error('No payslip line for this employee/run');
+      [runId, employeeId]
+    );
+    if (!itemRows.length) throw new Error('No payslip line for this employee/run');
 
-  return {
-    run: runRows[0],
-    employee: empRows[0],
-    item: itemRows[0],
-  };
+    return {
+      run: runRows[0],
+      employee: empRows[0],
+      item: itemRows[0],
+    };
+  } finally {
+    db.release();
+  }
 }
 
 function toCsv({ columns, rows }) {
   const esc = (v = '') => {
-    const s = String(v);
+    const raw = String(v);
+    const s = /^[=+\-@]/.test(raw) ? `'${raw}` : raw;
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const header = columns.map(esc).join(',');
@@ -1948,304 +2011,124 @@ function splitUsableAndWarnings(lines) {
   return { usable, warnings };
 }
 
-async function importTimesheetsFromCsv(runId, fileBuffer) {
-  // --- 1. Parse CSV ---
+async function importTimesheetsFromCsv(runId, fileBuffer, userId = null) {
   let records;
   try {
-    records = parse(fileBuffer, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
-  } catch (e) {
-    throw new Error(`Failed to parse CSV: ${e.message}`);
+    records = parse(fileBuffer, { columns: true, skip_empty_lines: true, trim: true });
+  } catch (error) {
+    throw new Error(`Failed to parse CSV: ${error.message}`);
   }
 
-  if (!Array.isArray(records) || !records.length) {
-    throw new Error('CSV appears to be empty or invalid');
-  }
+  if (!records.length) throw new Error('CSV is empty');
+  if (records.length > 10000) throw new Error('CSV exceeds the 10,000 row limit');
 
-  // Validate columns
-  const REQUIRED_COLS = [
-    'employee_number',
-    'regular_hours',
-    'ot_15_hours',
-    'ot_20_hours',
-    'allowances',
-    'deductions',
-    'notes',
-  ];
-  const headerCols = Object.keys(records[0] || {});
-  const missing = REQUIRED_COLS.filter(c => !headerCols.includes(c));
-  if (missing.length) {
-    throw new Error(`CSV missing required columns: ${missing.join(', ')}`);
-  }
-
-  // Optional: guard row count
-  const MAX_ROWS = 10000;
-  if (records.length > MAX_ROWS) {
-    throw new Error(`CSV has too many rows (${records.length}). Max allowed is ${MAX_ROWS}.`);
-  }
+  const required = ['employee_number', 'regular_hours'];
+  const headers = Object.keys(records[0]);
+  const missing = required.filter(column => !headers.includes(column));
+  if (missing.length) throw new Error(`CSV missing required columns: ${missing.join(', ')}`);
 
   const client = await pool.connect();
+  const errors = [];
   let inserted = 0;
   let updated = 0;
-  const errors = [];
 
   try {
     await client.query('BEGIN');
-
-    // --- 2. Validate pay run ---
     const { rows: runRows } = await client.query(
-      `SELECT id, status FROM pay_runs WHERE id = $1`,
+      'SELECT id, status FROM pay_runs WHERE id = $1 FOR UPDATE',
       [runId]
     );
-    if (!runRows.length) {
-      throw new Error(`Pay run not found with id ${runId}`);
-    }
+    if (!runRows.length) throw new Error(`Pay run ${runId} was not found`);
+    if (runRows[0].status !== 'Draft') throw new Error('Timesheets can only be imported into a Draft run');
 
-    // --- 3. Employee lookup ---
-    const allEmployeeNumbers = Array.from(
-      new Set(
-        records
-          .map(r => String(r.employee_number || '').trim())
-          .filter(v => v.length)
-      )
+    const employeeNumbers = [...new Set(records.map(row => String(row.employee_number || '').trim()).filter(Boolean))];
+    const { rows: employees } = await client.query(
+      `SELECT employee_id, employee_number, effective_hourly_rate
+         FROM employee
+        WHERE employee_number = ANY($1) AND is_active = true`,
+      [employeeNumbers]
     );
+    const employeesByNumber = new Map(employees.map(employee => [String(employee.employee_number), employee]));
+    const changedIds = [];
+    const seenEmployeeNumbers = new Set();
 
-    let employeesMap = new Map();
-    if (allEmployeeNumbers.length) {
-      const { rows: empRows } = await client.query(
-        `
-        SELECT employee_id, employee_number, effective_hourly_rate
-          FROM employee
-         WHERE employee_number = ANY($1)
-        `,
-        [allEmployeeNumbers]
-      );
-      for (const row of empRows) {
-        employeesMap.set(String(row.employee_number), row);
-      }
-    }
-
-    // --- 4. Process each record ---
-    for (let i = 0; i < records.length; i++) {
-      const row = records[i];
-      const rowNumber = i + 2;
-
-      try {
-        const employeeNumber = String(row.employee_number || '').trim();
-        if (!employeeNumber) {
-          errors.push({ row: rowNumber, error: 'Missing employee_number' });
-          continue;
-        }
-
-        const emp = employeesMap.get(employeeNumber);
-        if (!emp) {
-          errors.push({
-            row: rowNumber,
-            error: `Employee not found for employee_number=${employeeNumber}`,
-          });
-          continue;
-        }
-        const employeeId = emp.employee_id;
-
-        // Parse numeric fields
-        const regularHours = Number(row.regular_hours || 0);
-        const ot15Hours = Number(row.ot_15_hours || 0);
-        const ot20Hours = Number(row.ot_20_hours || 0);
-        const allowance = Number(row.allowances || 0);
-        const deductions = Number(row.deductions || 0);
-        const note = row.notes || null;
-
-        // Simple business validation
-        if (regularHours < 0 || ot15Hours < 0 || ot20Hours < 0) {
-          errors.push({
-            row: rowNumber,
-            error: 'Hours cannot be negative',
-          });
-          continue;
-        }
-
-        if (allowance < 0 || deductions < 0) {
-          errors.push({
-            row: rowNumber,
-            error: 'Allowance/deductions cannot be negative',
-          });
-          continue;
-        }
-
-        const rate = Number(emp.effective_hourly_rate || 0);
-
-        let taxRate = Number(emp.tax_rate || 0);
-        if (taxRate > 1) {
-          taxRate = taxRate / 100; // interpret as percentage
-        }
-
-        const baseHours = isNaN(hours) ? 0 : hours;
-        const baseOt15 = isNaN(ot15Hours) ? 0 : ot15Hours;
-        const baseOt20 = isNaN(ot20Hours) ? 0 : ot20Hours;
-        const baseAllowance = isNaN(allowance) ? 0 : allowance;
-        const baseDeductions = isNaN(deductions) ? 0 : deductions;
-
-        const grossFromHours =
-          rate * baseHours +
-          rate * baseOt15 * 1.5 +
-          rate * baseOt20 * 2.0;
-
-        const gross = grossFromHours + baseAllowance;
-        const tax = gross * taxRate;
-        const superAmount = grossFromHours * SUPER_RATE;
-        const net = gross - tax - baseDeductions;
-
-        // Ensure non-negative for your chk_pay_run_items_nonneg
-        const safeGross = Math.max(0, round2(gross));
-        const safeTax = Math.max(0, round2(tax));
-        const safeDeductions = Math.max(0, round2(baseDeductions));
-        const safeNet = Math.max(0, round2(net));
-        const safeRate = Math.max(0, round2(rate));
-        const safeHours = Math.max(0, round2(baseHours));
-        const safeAllowance = Math.max(0, round2(baseAllowance));
-        const safeSuper = Math.max(0, round2(superAmount));
-        const safeOt15 = Math.max(0, round2(baseOt15));
-        const safeOt20 = Math.max(0, round2(baseOt20));
-
-        const { rows: upsertRows } = await client.query(
-          `
-           INSERT INTO pay_run_items (
-            pay_run_id,
-            employee_id,
-            gross,
-            tax,
-            deductions_total,
-            net,
-            rate,
-            hours,
-            allowance,
-            super,
-            status,
-            note,
-            ot_15_hours,
-            ot_20_hours
-          )
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Draft',$11,$12,$13)
-          ON CONFLICT (pay_run_id, employee_id)
-          DO UPDATE SET
-            gross            = EXCLUDED.gross,
-            tax              = EXCLUDED.tax,
-            deductions_total = EXCLUDED.deductions_total,
-            net              = EXCLUDED.net,
-            rate             = EXCLUDED.rate,
-            hours            = EXCLUDED.hours,
-            allowance        = EXCLUDED.allowance,
-            super            = EXCLUDED.super,
-            status           = EXCLUDED.status,
-            note             = EXCLUDED.note,
-            ot_15_hours      = EXCLUDED.ot_15_hours,
-            ot_20_hours      = EXCLUDED.ot_20_hours
-          RETURNING xmax = 0 AS inserted;
-          `,
-          [
-            runId,
-            employeeId,
-            safeGross,
-            safeTax,
-            safeDeductions,
-            safeNet,
-            safeRate,
-            safeHours,
-            safeAllowance,
-            safeSuper,
-            note,
-            safeOt15,
-            safeOt20,
-          ]
-        );
-
-        if (upsertRows[0].inserted) inserted++;
-        else updated++;
-      } catch (rowErr) {
-        console.error('[importTimesheets] row error', rowErr);
-        errors.push({ row: rowNumber, error: rowErr.message });
+    for (let index = 0; index < records.length; index += 1) {
+      const row = records[index];
+      const rowNumber = index + 2;
+      const employeeNumber = String(row.employee_number || '').trim();
+      if (seenEmployeeNumbers.has(employeeNumber)) {
+        errors.push({ row: rowNumber, error: `Duplicate employee_number ${employeeNumber || '(blank)'} in CSV` });
         continue;
       }
+      seenEmployeeNumbers.add(employeeNumber);
+      const employee = employeesByNumber.get(employeeNumber);
+      if (!employee) {
+        errors.push({ row: rowNumber, error: `Active employee ${employeeNumber || '(blank)'} was not found` });
+        continue;
+      }
+
+      const values = {
+        hours: Number(row.regular_hours || 0),
+        ot15: Number(row.ot_15_hours || 0),
+        ot20: Number(row.ot_20_hours || 0),
+        allowance: Number(row.allowances || 0),
+        deductions: Number(row.deductions || 0),
+        tax: Number(row.tax || 0),
+        rate: Number(employee.effective_hourly_rate || 0),
+      };
+      if (Object.values(values).some(value => !Number.isFinite(value) || value < 0)) {
+        errors.push({ row: rowNumber, error: 'Hours and money fields must be non-negative numbers' });
+        continue;
+      }
+      if (values.rate <= 0) {
+        errors.push({ row: rowNumber, error: `Employee ${employeeNumber} has no effective hourly rate` });
+        continue;
+      }
+
+      const { rows } = await client.query(
+        `INSERT INTO pay_run_items
+          (pay_run_id, employee_id, hours, rate, allowance, ot_15_hours,
+           ot_20_hours, tax, deductions_total, note, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Draft')
+         ON CONFLICT (pay_run_id, employee_id) DO UPDATE SET
+           hours = EXCLUDED.hours,
+           rate = EXCLUDED.rate,
+           allowance = EXCLUDED.allowance,
+           ot_15_hours = EXCLUDED.ot_15_hours,
+           ot_20_hours = EXCLUDED.ot_20_hours,
+           tax = EXCLUDED.tax,
+           deductions_total = EXCLUDED.deductions_total,
+           note = EXCLUDED.note,
+           updated_by = $11,
+           updated_at = now()
+         RETURNING id, (xmax = 0) AS inserted`,
+        [runId, employee.employee_id, values.hours, values.rate, values.allowance,
+          values.ot15, values.ot20, values.tax, values.deductions,
+          String(row.notes || '').trim() || null, userId || null]
+      );
+      changedIds.push(rows[0].id);
+      if (rows[0].inserted) inserted += 1;
+      else updated += 1;
     }
 
-    // --- 5. Recalculate totals (reuse your existing helper if you have one) ---
-    await recalculateRunTotals(client, runId);
-
+    for (const id of changedIds) await recalcLine(client, id);
+    const summary = await recomputeRunSummary(client, runId);
+    await writeAudit(client, {
+      userId,
+      action: 'TIMESHEETS_IMPORTED',
+      entityType: 'pay_run',
+      entityId: runId,
+      afterData: { records: records.length, inserted, updated, rejected: errors.length },
+    });
     await client.query('COMMIT');
 
-    return {
-      run_id: runId,
-      records: records.length,
-      inserted,
-      updated,
-      error_count: errors.length,
-      errors,
-    };
-  } catch (err) {
+    return { run_id: runId, records: records.length, inserted, updated, rejected: errors.length, errors, summary };
+  } catch (error) {
     await client.query('ROLLBACK');
-    throw err;
+    throw error;
   } finally {
     client.release();
   }
-}
-
-async function recalculateRunTotals(client, runId) {
-  await client.query(
-    `
-    UPDATE pay_runs r
-       SET totals_employees = sub.cnt,
-           totals_gross     = sub.total_gross,
-           totals_net       = sub.total_net,
-           updated_at       = NOW()
-      FROM (
-        SELECT
-          run_id,
-          COUNT(*)                        AS cnt,
-          COALESCE(SUM(gross_amount), 0)  AS total_gross,
-          COALESCE(SUM(net_amount), 0)    AS total_net
-        FROM pay_run_items
-        WHERE pay_run_id = $1
-        GROUP BY pay_run_id
-      ) sub
-     WHERE r.id = sub.run_id
-       AND r.id = $1;
-    `,
-    [runId]
-  );
-}
-
-function round2(value) {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
-
-function calculateSamoaTaxForPeriod(grossForPeriod, payCycle) {
-  const cyclesPerYear = {
-    WEEKLY: 52,
-    FORTNIGHTLY: 26,
-    FORTNIGHT: 26,
-    MONTHLY: 12,
-    ANNUAL: 1,
-  };
-
-  const periods = cyclesPerYear[payCycle] || 52;
-  const annualIncome = grossForPeriod * periods;
-
-  let annualTax = 0;
-
-  if (annualIncome > 25000) {
-    annualTax =
-      (annualIncome - 25000) * 0.27 +
-      (25000 - 15000) * 0.20;
-  } else if (annualIncome > 15000) {
-    annualTax = (annualIncome - 15000) * 0.20;
-  } else {
-    annualTax = 0;
-  }
-
-  return annualTax / periods;
 }
 
 async function getSamoaContributionsSummary(runId) {
@@ -2254,6 +2137,14 @@ async function getSamoaContributionsSummary(runId) {
     const id = runId ?? (await getActiveRunId(client));
     if (!id) {
       return { ok: false, message: 'No active run', employees: [], totals: {} };
+    }
+
+    const { rows: runRows } = await client.query(
+      `SELECT status FROM pay_runs WHERE id = $1`,
+      [id]
+    );
+    if (!runRows.length) {
+      return { ok: false, message: 'Pay run not found', employees: [], totals: {} };
     }
 
     const { rows } = await client.query(
@@ -2299,10 +2190,47 @@ async function getSamoaContributionsSummary(runId) {
       { gross: 0, tax: 0, npf_employee: 0, npf_employer: 0, acc_employer: 0, net: 0 }
     );
 
-    return { ok: true, run_id: id, employees, totals };
+    return { ok: true, run_id: id, status: runRows[0].status, employees, totals };
   } finally {
     client.release();
   }
+}
+
+async function buildSuperCsvForCurrentRun({ runId } = {}) {
+  const summary = await getSamoaContributionsSummary(runId);
+  if (!summary.ok) {
+    return { filename: 'npf-export.csv', csv: '', warnings: [summary.message] };
+  }
+  if (!['Approved', 'Posted'].includes(summary.status)) {
+    return {
+      filename: `npf-run-${summary.run_id}.csv`,
+      csv: '',
+      warnings: ['NPF exports require an Approved or Posted pay run'],
+    };
+  }
+
+  const columns = [
+    'employee_id',
+    'employee_name',
+    'gross',
+    'npf_employee',
+    'npf_employer',
+    'acc_employer',
+  ];
+  const rows = summary.employees.map(employee => ({
+    employee_id: employee.employee_id,
+    employee_name: employee.name,
+    gross: employee.gross.toFixed(2),
+    npf_employee: employee.npf_employee.toFixed(2),
+    npf_employer: employee.npf_employer.toFixed(2),
+    acc_employer: employee.acc_employer.toFixed(2),
+  }));
+
+  return {
+    filename: `npf-run-${summary.run_id}.csv`,
+    csv: toCsv({ columns, rows }),
+    warnings: [],
+  };
 }
 
 module.exports = {
@@ -2316,8 +2244,8 @@ module.exports = {
   recalcCurrentRun,
   approveCurrentRun,
   postCurrentRun,
+  reopenCurrentRun,
   updateCurrentItem,      // (lineId, patch, userId)
-  updateCurrentRunStatus,   // (status, userId)
   startForPeriod,
   validateCurrentRun,
   addCurrentRunItem,

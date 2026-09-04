@@ -1,5 +1,6 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
+const { passwordError, normalizeRole } = require('./passwordPolicy');
 
 async function updateUserService(userId, payload) {
     const client = await pool.connect();
@@ -16,16 +17,15 @@ async function updateUserService(userId, payload) {
         }
 
         if (payload.role !== undefined) {
-            const normalizeRole = String(payload.role || '').trim().toLocaleLowerCase();
-            const allowedRoles = ["admin", "hr", "manager", "employee"];
+            const normalizedRole = normalizeRole(payload.role);
 
-            if(!allowedRoles.includes(normalizeRole)) {
-                const error = new Error(`Invalid roles: ${payload.role}`);
+            if(!normalizedRole) {
+                const error = new Error(`Invalid role: ${payload.role}`);
                 error.status = 400;
                 throw error;
             }
             setClauses.push(`role = $${index++}`);
-            values.push(normalizeRole);
+            values.push(normalizedRole);
         }
 
         if (payload.employee_id !== undefined) {
@@ -34,13 +34,19 @@ async function updateUserService(userId, payload) {
         }
 
         if (payload.password) {
+            const invalidPassword = passwordError(payload.password);
+            if (invalidPassword) {
+                const error = new Error(invalidPassword);
+                error.status = 400;
+                throw error;
+            }
             const hash = await bcrypt.hash(payload.password, 10);
             setClauses.push(`password_hash = $${index++}`);
             values.push(hash);
         }
 
         if (setClauses.length === 0) {
-            await client.release();
+            await client.query("ROLLBACK");
             return { message: "Nothing to update" };
         }
 
@@ -57,6 +63,11 @@ async function updateUserService(userId, payload) {
 
         await client.query("COMMIT");
 
+        if (!rows[0]) {
+            const error = new Error('User not found');
+            error.status = 404;
+            throw error;
+        }
         return rows[0];
 
     } catch (err) {
@@ -71,4 +82,3 @@ async function updateUserService(userId, payload) {
 module.exports = {
     updateUserService
 }
-
