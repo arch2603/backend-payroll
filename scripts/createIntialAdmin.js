@@ -4,9 +4,16 @@ const pool = require('../db');
 const bcrypt = require('bcrypt');
 
 async function createAdmin() {
-  const username = process.env.INIT_ADMIN_USERNAME || 'admin';
-  const password = process.env.INIT_ADMIN_PASSWORD || 'AdminPass123!'; // change immediately
+  const username = process.env.INIT_ADMIN_USERNAME;
+  const password = process.env.INIT_ADMIN_PASSWORD;
   const role = 'admin';
+
+  if (!username || !password) {
+    throw new Error('INIT_ADMIN_USERNAME and INIT_ADMIN_PASSWORD are required');
+  }
+  if (password.length < 12) {
+    throw new Error('INIT_ADMIN_PASSWORD must be at least 12 characters');
+  }
 
   try {
     const hashed = await bcrypt.hash(password, 10);
