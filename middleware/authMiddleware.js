@@ -1,4 +1,3 @@
-console.log('[authMiddleware] loaded from:', __filename);
 const jwt = require("jsonwebtoken");
 
 function sendAuthError(res, code, message) {
@@ -8,6 +7,11 @@ function sendAuthError(res, code, message) {
 
 
 function authenticateToken(req, res, next) {
+
+  if (!process.env.JWT_SECRET) {
+    console.error('[auth] JWT_SECRET is not configured');
+    return res.status(500).json({ code: 'AUTH_NOT_CONFIGURED', error: 'Authentication is not configured' });
+  }
 
   const authHeader = req.headers.authorization || '';
 
@@ -45,7 +49,9 @@ function authorizeRoles(...allowedRoles) {
       return sendAuthError(res, 'UNAUTHENTICATED', 'Unauthenticated');;
     }
 
-    if (!allowedRoles.includes(req.user.role)) {
+    const role = String(req.user.role || '').trim().toLowerCase();
+    const normalizedAllowed = allowedRoles.map(value => String(value).toLowerCase());
+    if (!normalizedAllowed.includes(role)) {
       return res.status(403).json({ code: 'FORBIDDEN', error: "Forbidden: insufficient rights" });
     }
     return next();
