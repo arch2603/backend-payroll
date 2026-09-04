@@ -3,7 +3,9 @@ const pool = require("../db"); // database pool
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");           // <-- make sure this exists
 const nodemailer = require("nodemailer");
-const otpDigits = () => String(Math.floor(100000 + Math.random() * 900000));
+const { passwordError, normalizeRole } = require('../service/passwordPolicy');
+const otpDigits = () => String(crypto.randomInt(100000, 1000000));
+const hashResetToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -15,22 +17,22 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-transporter.verify()
-  .then(() => console.log("[mailer] SMTP ready"))
-  .catch(err => console.error("[mailer] SMTP verify failed:", err));
-
 // Register new user (Admin only)
 const registerUser = async (req, res) => {
 
   const { username, password, role = 'employee', employee_id = null } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'username and password required' });
+  const invalidPassword = passwordError(password);
+  if (invalidPassword) return res.status(400).json({ message: invalidPassword });
+  const normalizedRole = normalizeRole(role);
+  if (!normalizedRole) return res.status(400).json({ message: 'Invalid role' });
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const queryCreate = `INSERT INTO users (username, password_hash, role, employee_id) 
                          VALUES ($1, $2, $3, $4) 
                          RETURNING user_id, username, role, employee_id, created_at`;
-    const vals = [username, hashedPassword, role, employee_id || null];
+    const vals = [String(username).trim(), hashedPassword, normalizedRole, employee_id || null];
     const result = await pool.query(queryCreate, vals);
 
     return res.status(200).json(result.rows[0]);
@@ -43,11 +45,16 @@ const registerUser = async (req, res) => {
   }
 };
 
+//-----Helpers--------------------------------------
+
 const login = async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'username & password required' });
 
   try {
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({ message: 'Authentication is not configured' });
+    }
     const q = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     if (q.rows.length === 0) return res.status(401).json({ message: 'Invalid credentials' });
 
@@ -81,6 +88,8 @@ const changePassword = async (req, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ message: "Missing fields" });
     }
+    const invalidPassword = passwordError(newPassword);
+    if (invalidPassword) return res.status(400).json({ message: invalidPassword });
 
     // fetch current hash
     const { rows } = await pool.query(
@@ -98,7 +107,6 @@ const changePassword = async (req, res) => {
       [hash, userId]
     );
 
-    console.log("[change-password] OK for user", userId);
     return res.json({ message: "Password updated" });  // ✅ send a response
   } catch (err) {
     console.error("changePassword error:", err);
@@ -112,11 +120,13 @@ const resetPassword = async (req, res) => {
     if (!token || !password) {
       return res.status(400).json({ message: "token and password required" });
     }
+    const invalidPassword = passwordError(password);
+    if (invalidPassword) return res.status(400).json({ message: invalidPassword });
 
     // Find user with valid non-expired token
     const { rows } = await pool.query(
       `SELECT user_id FROM users WHERE reset_token = $1 AND reset_expires > NOW()`,
-      [token]
+      [hashResetToken(token)]
     );
     if (!rows[0]) {
       return res.status(400).json({ message: "Invalid or expired token" });
@@ -153,7 +163,7 @@ const requestPasswordReset = async (req, res) => {
 
     const { rows } = await pool.query(
       email
-        ? `SELECT user_id, email FROM users WHERE email = $1`
+        ? `SELECT user_id, email FROM users WHERE lower(email) = lower($1)`
         : `SELECT user_id, email FROM users WHERE username = $1`,
       [email || username]
     );
@@ -169,20 +179,24 @@ const requestPasswordReset = async (req, res) => {
 
     await pool.query(
       `UPDATE users SET reset_token = $1, reset_expires = $2 WHERE user_id = $3`,
-      [token, expires, userId]
+      [hashResetToken(token), expires, userId]
     );
 
-    const resetUrl = `${process.env.FRONTEND_URL || "http://192.168.1.120:3001"}/reset-password?token=${encodeURIComponent(token)}`;
+    const resetUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/reset-password?token=${encodeURIComponent(token)}`;
 
-    await transporter.sendMail({
-      from: process.env.FROM_EMAIL || "no-reply@localhost",
-      to: userEmail || email,
-      subject: "Reset your password",
-      text: `Click this link to reset your password: ${resetUrl} (valid for 1 hour)`,
-      html: `<p>Click this link to reset your password:</p>
-             <p><a href="${resetUrl}">${resetUrl}</a></p>
-             <p>This link is valid for 1 hour.</p>`
-    });
+    try {
+      await transporter.sendMail({
+        from: process.env.FROM_EMAIL || "no-reply@localhost",
+        to: userEmail || email,
+        subject: "Reset your password",
+        text: `Click this link to reset your password: ${resetUrl} (valid for 1 hour)`,
+        html: `<p>Click this link to reset your password:</p>
+               <p><a href="${resetUrl}">${resetUrl}</a></p>
+               <p>This link is valid for 1 hour.</p>`
+      });
+    } catch (mailError) {
+      console.error('[mailer] password reset delivery failed:', mailError.message);
+    }
 
     return res.json({ message: "If an account exists, a reset link has been sent." });
   } catch (err) {
@@ -203,15 +217,15 @@ const oneTimePasswordReset = async (req, res) => {
     }
 
     const selectSql = email ?
-      "SELECT user_id FROM users WHERE email = $1" :
-      "SELECT user_id FROM users WHERE username = $1";
+      "SELECT user_id, email FROM users WHERE lower(email) = lower($1)" :
+      "SELECT user_id, email FROM users WHERE username = $1";
 
     const selectVal = [email || username];
 
     const { rows } = await pool.query(selectSql, selectVal);
 
     if (rows.length === 0) {
-      return res.json({ message: "If an account exists, a reset link has been sent. " })
+      return res.json({ message: "If an account exists, an OTP has been sent." })
     }
 
     const { user_id: userId, email: userEmail } = rows[0];
@@ -245,10 +259,7 @@ const oneTimePasswordReset = async (req, res) => {
     } else{
       console.warn("[OTP] No email available for userId:", userId);
     }
-    return res.json({
-      message: "If an account exists, an OTP has been sent.",
-      dev_otp: process.env.NODE_ENV === "production" ? undefined : code
-    });
+    return res.json({ message: "If an account exists, an OTP has been sent." });
 
   } catch (err) {
     console.error("oneTimePasswordReset error:", err);
@@ -265,11 +276,13 @@ const resetOtpPassword = async (req, res) => {
     if (!idv || !otp || !password) {
       return res.status(400).json({ message: "Missing fields" });
     }
+    const invalidPassword = passwordError(password);
+    if (invalidPassword) return res.status(400).json({ message: invalidPassword });
 
     const { rows } = await pool.query(
       `SELECT user_id, reset_otp_hash, reset_otp_expires, reset_otp_attempts, email, username
          FROM users
-        WHERE email = $1 OR username = $1`,
+        WHERE lower(email) = lower($1) OR username = $1`,
       [idv]
     );
     if (rows.length === 0) {

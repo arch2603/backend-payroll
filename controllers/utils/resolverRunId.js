@@ -1,3 +1,5 @@
+const pool = require('../../db');
+
 async function resolveRunId(req) {
   if (req.params?.id) {
     const id = Number(req.params.id);
@@ -9,14 +11,11 @@ async function resolveRunId(req) {
     if (Number.isFinite(id) && id > 0) return id;
   }
 
-  const pool = req.app?.locals?.db;
-  if (!pool) throw new Error('DB handle not provided to resolveRunId');
-
   const { rows } = await pool.query(
-    `SELECT id
-     FROM pay_runs
-     WHERE status = 'Draft'
-     ORDER BY created_at DESC NULLS LAST, id DESC
+    `SELECT r.id
+     FROM pay_runs r
+     JOIN pay_periods p ON p.id = r.period_id
+     ORDER BY r.created_at DESC NULLS LAST, id DESC
      LIMIT 1`
   );
   const row = rows[0] || null;

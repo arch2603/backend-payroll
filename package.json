@@ -12,6 +12,7 @@
   "dependencies": {
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
     "dayjs": "^1.11.19",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",

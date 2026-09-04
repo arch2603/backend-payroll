@@ -1,8 +1,8 @@
-// routes/employeeRoute.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
-const { authenticateToken } = require('../middleware/authMiddleware');
+const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
+const employeeCtrl = require('../controllers/employeeController');
 
 // GET /api/employees?search=&limit=50&offset=0
 router.get('/', authenticateToken, async (req, res) => {
@@ -57,13 +57,8 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-// router.get('/count', authenticateToken, async (_req, res) => {
-//   const q = await pool.query(`
-//     SELECT COUNT(*)::int AS count
-//     FROM employee
-//     WHERE COALESCE(is_active, true) = true
-//   `);
-//   res.json({ count: q.rows[0].count });
-// });
+router.post('/create', authenticateToken, authorizeRoles('admin','hr'), employeeCtrl.createEmployee);
+router.patch('/patch/:empId', authenticateToken, authorizeRoles('admin','hr'), employeeCtrl.updateEmployee);
+router.get('/:empId', authenticateToken, authorizeRoles('admin','hr'), employeeCtrl.getEmployeeById);
 
 module.exports = router;

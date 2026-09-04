@@ -17,17 +17,12 @@ const payPeriodRoutes = require("./routes/payPeriodRoutes");
 
 const app = express();
 const db = require('./db');
-const { boolean } = require("zod");
+//const { boolean } = require("zod");
 app.locals.db = db;
 
 const PORT = process.env.PORT || 5000;
 
-// const ALLOWED_ORIGINS = [
-//   "http://localhost:5173",
-//   "http://192.168.1.120:3001",
-//   "http://192.168.1.100:5173",
-//   "http://192.168.1.101:5173", // add your actual Vite origin(s)
-// ];
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "http://localhost:5173").split(',').map( origin => origin.trim());
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS.split(',').map( o => o.trim()).filter(boolean);
 

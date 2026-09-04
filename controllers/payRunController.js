@@ -1,12 +1,6 @@
 const { z } = require('zod');
-let payRunService;
-try {
-  payRunService = require('../service/payRunService');
-} catch (error) {
-  console.warn('[payRun] payRunService not found - using safe fallbacks');
-  console.warn("[payRun] require error was:", error);
-  payRunService = null;
-};
+const payRunService = require('../services/payRunService');
+
 
 const numLike = z.coerce.number();
 
@@ -21,15 +15,20 @@ const UpdateLineSchema = z.object({
   deductions: numLike.min(0).max(1e9).optional(),       // we'll map this below
   super: numLike.min(0).max(1e9).optional(),
   note: z.string().max(500).optional()
-}).refine(obj => {
+}).refine((obj) => obj._recalc || Object.keys(obj).length > 0, { message: 'No fields to update' });
 
-  if (obj._recalc) return true;
-  return Object.keys(obj).some(k =>
-    ['hours', 'rate', 'allowance', 'ot_15_hours', 'ot_20_hours', 'tax', 'deductions', 'super', 'note'].includes(k)
-  );
-}, { message: 'No fields to update' });
+const AddLineSchema = z.object({
+  employee_id: z.coerce.number().int().positive(),
+  hours: numLike.min(0).max(1000).default(0),
+  rate: numLike.min(0).max(1e9).optional(),
+  allowance: numLike.min(0).max(1e9).default(0),
+  ot_15_hours: numLike.min(0).max(1000).default(0),
+  ot_20_hours: numLike.min(0).max(1000).default(0),
+  deductions: numLike.min(0).max(1e9).optional(),
+  deductions_total: numLike.min(0).max(1e9).optional(),
+  note: z.string().max(500).optional(),
+});
 
-const { resolveRunId } = require('./utils/resolverRunId');
 
 
 function emptySummary() {
@@ -386,6 +385,59 @@ exports.viewPayslipInline = async (req, res, next) => {
     }
   }
 };
+
+exports.getCurrentSamoaSummary = async (req, res, next) => {
+  try {
+    const result = await payRunService.getSamoaContributionsSummary(undefined);
+    if (!result.ok) {
+      return res.status(400).json({ message: result.message || 'Unable to compute Samoa contributions' });
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('[payRun] getCurrentSamoaSummary error', err);
+    next(err);
+  }
+};
+
+exports.getSamoaSummaryByRunId = async (req, res, next) => {
+  try {
+    const runId = Number(req.params.runId);
+    if (!Number.isFinite(runId) || runId <= 0) {
+      return res.status(400).json({ message: 'Invalid run id' });
+    }
+    const result = await payRunService.getSamoaContributionsSummary(runId);
+    if (!result.ok) {
+      return res.status(400).json({ message: result.message || 'Unable to compute Samoa contributions' });
+    }
+    return res.json(result);
+  } catch (err) {
+    console.error('[payRun] getSamoaSummaryByRunId error', err);
+    next(err);
+  }
+};
+
+exports.exportSuperFile = async (req, res) => {
+
+  try {
+    if (!payRunService?.buildSuperCsvForCurrentRun) {
+      return res.status(501).json({ message: 'Super file export not implemented' });
+    }
+    const runId = req.query.run_id ? Number(req.query.run_id) : null;
+    const { filename, csv } = await payRunService.buildSuperCsvForCurrentRun({ runId });
+    
+    if (!csv || !csv.length) {
+      return res.status(400).json({ message: 'No rows to export' });
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename || 'super_export.csv'}"`);
+    return res.send(csv);
+
+  } catch (error) {
+    console.error('[payRun] exportSuperFile error:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  } 
+};
+
 
 
 

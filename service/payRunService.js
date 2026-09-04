@@ -5,9 +5,14 @@ const dayjs = require('dayjs');
 const tz = require('dayjs/plugin/timezone'); dayjs.extend(tz);
 const utc = require('dayjs/plugin/utc'); dayjs.extend(utc);
 const PDFDocument = require('pdfkit');
+const { parse } = require('csv-parse/sync');
 
 const REMITTER = process.env.BANK_REMITTER_NAME || 'talitrendyfusion';
 const EXPORT_TZ = 'Australia/Brisbane';
+
+const NPF_MEMBER_RATE = Number(process.env.NPF_MEMBER_RATE || '0.10');    // employee 10%
+const NPF_EMPLOYER_RATE = Number(process.env.NPF_EMPLOYER_RATE || '0.10'); // employer 10%
+
 
 const num = (v) => Number(v || 0);
 
@@ -38,33 +43,20 @@ function periodEndSQL(alias = 'pp') {
 }
 
 async function recalcLine(client, id) {
-  const { rows: lineRows } = await client.query(`
-    SELECT 
-      id, employee_id, pay_run_id,
-      COALESCE(hours,0)                  AS hours,
-      COALESCE(rate,0)                   AS rate,
-      COALESCE(allowance,0)              AS allowance,
-      COALESCE(tax,0)                    AS tax,
-      COALESCE(ot_15_hours,0)            AS ot_15_hours,
-      COALESCE(ot_20_hours,0)            AS ot_20_hours,                    
-      COALESCE("super",0)                AS "super",
-      COALESCE(deductions_total,0)    AS deductions_total
+
+  const { rows: lineRows } = await client.query(
+    `
+    SELECT id
     FROM pay_run_items
     WHERE id = $1
-  `, [id]);
+    `,
+    [id]
+  );
 
   if (lineRows.length === 0) return null;
 
-  const L = lineRows[0];
-  const base = Number(L.hours) * Number(L.rate);
-  const ot15 = Number(L.ot_15_hours || 0) * Number(L.rate || 0) * 1.5;
-  const ot20 = Number(L.ot_20_hours || 0) * Number(L.rate || 0) * 2;
-  const gross = base + ot15 + ot20 + Number(L.allowance || 0);
-  const tax = Number(L.tax || 0);
-  const sup = Number(L.super || 0);
-  const net = gross - tax - Number(L.deductions_total || 0) - sup;
-
-  const { rows } = await client.query(`
+  const { rows } = await client.query(
+    `
     WITH src AS (
       SELECT
         pri.id,
@@ -76,32 +68,62 @@ async function recalcLine(client, id) {
         COALESCE(pri.ot_15_hours, 0)     AS ot15,
         COALESCE(pri.ot_20_hours, 0)     AS ot20,
         COALESCE(pri.tax, 0)             AS tax,
-        COALESCE(pri."super", 0)         AS sup,
         COALESCE(pri.deductions_total,0) AS ded
       FROM pay_run_items pri
       WHERE pri.id = $1
       FOR UPDATE
     ),
-    calc AS (
+    base_calc AS (
       SELECT
         id,
-        -- base + OT1.5 + OT2.0 + allowance
-        ROUND(hours*rate + ot15*rate*1.5 + ot20*rate*2 + allowance, 2) AS gross,
+        employee_id,
+        pay_run_id,
+        hours,
+        rate,
+        allowance,
+        ot15,
+        ot20,
         tax,
-        sup,
         ded,
-        ROUND((hours*rate + ot15*rate*1.5 + ot20*rate*2 + allowance) - tax - ded - sup, 2) AS net
+        -- base + OT1.5 + OT2.0 + allowance
+        ROUND(hours*rate + ot15*rate*1.5 + ot20*rate*2 + allowance, 2) AS gross
       FROM src
+    ),
+    samoan AS (
+      SELECT
+        id,
+        employee_id,
+        pay_run_id,
+        hours,
+        rate,
+        allowance,
+        ot15,
+        ot20,
+        tax,
+        ded,
+        gross,
+        -- Samoa NPF & ACC contributions (hard-coded rates for now)
+        ROUND(gross * 0.10, 2) AS npf_employee,  -- 10% employee
+        ROUND(gross * 0.10, 2) AS npf_employer,  -- 10% employer
+        ROUND(gross * 0.01, 2) AS acc_employer,  -- 1% employer ACC
+        -- NET = gross - tax - other deductions - employee NPF
+        ROUND(gross - tax - ded - (gross * 0.10), 2) AS net
+      FROM base_calc
     )
     UPDATE pay_run_items p
     SET
-      gross      = c.gross,
-      tax        = c.tax,
-      "super"    = c.sup,
-      net        = c.net,
-      updated_at = NOW()
-    FROM calc c
-    WHERE p.id = c.id
+      gross         = s.gross,
+      tax           = s.tax,
+      net           = s.net,
+      -- Persist Samoa contributions:
+      npf_employee  = s.npf_employee,
+      npf_employer  = s.npf_employer,
+      acc_employer  = s.acc_employer,
+      -- Keep legacy "super" in sync with employee NPF:
+      "super"       = s.npf_employee,
+      updated_at    = NOW()
+    FROM samoan s
+    WHERE p.id = s.id
     RETURNING
       p.id AS line_id,
       p.employee_id,
@@ -112,15 +134,21 @@ async function recalcLine(client, id) {
       p.gross,
       p.tax,
       p."super",
+      p.npf_employee,
+      p.npf_employer,
+      p.acc_employer,
       p.deductions_total AS deductions,
-      p.ot_15_hours AS time_half,
-      p.ot_20_hours AS double_time,
+      p.ot_15_hours      AS time_half,
+      p.ot_20_hours      AS double_time,
       p.net,
       p.status
-  `, [id]);
+    `,
+    [id]
+  );
 
   return rows[0] ?? null;
 }
+
 
 async function recomputeRunSummary(client, runId) {
   const { rows } = await client.query(`
@@ -332,7 +360,10 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
         l.deductions_total,
         l.super,
         l.net,
-        l.status
+        l.status,
+        l.npf_employee,
+        l.npf_employer,
+        l.acc_employer
       FROM pay_run_items l
       JOIN employee e ON e.employee_id = l.employee_id
       WHERE l.pay_run_id = $1
@@ -360,6 +391,9 @@ async function getCurrentRunItems({ search = '', limit = 25, offset = 0 } = {}) 
       tax: Number(r.tax ?? 0),
       deductions: Number(r.deductions_total ?? 0),
       super: Number(r.super ?? 0),
+      npfEmployee: Number(r.npf_employee ?? 0),
+      npfEmployer: Number(r.npf_employer ?? 0),
+      accEmployer: Number(r.acc_employer ?? 0),
       net: Number(r.net ?? 0),
       status: r.status
     }));
@@ -704,17 +738,15 @@ async function addCurrentRunItem(payload) {
       allowance = 0,
       tax = 0,
       deductions_total = 0,
-      super_amount = 0,
       note = null,
+      ot_15_hours = 0,
+      ot_20_hours = 0,
     } = payload;
 
-    const gross = (Number(hours) * Number(rate)) + Number(allowance);
-    const net = gross - Number(tax) - Number(deductions_total) - Number(super_amount);
-
-    const { rows } = await client.query(`
+    const { rows: insertedRows } = await client.query(`
       INSERT INTO pay_run_items
-        (pay_run_id, employee_id, hours, rate, allowance,
-         gross, tax, deductions_total, super, net, note)
+        (pay_run_id, employee_id, hours, rate, allowance, ot_15_hours, ot_20_hours,
+         tax, deductions_total, "super", note)
       VALUES
         ($1, $2, $3, $4, $5,
          $6, $7, $8, $9, $10, $11)
@@ -725,17 +757,26 @@ async function addCurrentRunItem(payload) {
       hours,
       rate,
       allowance,
-      gross,
+      ot_15_hours,
+      ot_20_hours,
       tax,
       deductions_total,
-      super_amount,
-      net,
+      0,
       note
     ]);
+    const inserted = insertedRows[0];
+
+    await recalcLine(client, inserted.id);
+
+    const { rows: finalRows } = await client.query(
+      `SELECT * FROM pay_run_items WHERE id = $1`,
+      [inserted.id]
+    );
+    const finalLine = finalRows[0];
 
     await recomputeRunSummary(client, run.id);
     await client.query('COMMIT');
-    return rows[0];
+    return finalLine;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -784,9 +825,11 @@ async function recalcCurrentRun() {
       await recalcLine(client, row.id);
     }
     const summary = await recomputeRunSummary(client, runId);
+    await client.query('COMMIT');
     return { ok: true, run_id: runId, ...summary };
   } catch (error) {
     await client.query('ROLLBACK');
+    throw error;
   } finally {
     client.release();
   }
@@ -953,6 +996,67 @@ async function buildBankCsvForCurrentRun({ runId: explicitRunId } = {}) {
   }
 }
 
+async function buildSuperCsvForCurrentRun({ runId=null } = {}) {
+  const client = await pool.connect();
+  try {
+    const activeRunId = runId ?? (await getActiveRunId(client));
+
+    if (!activeRunId) {
+      return { filename: 'super-file.csv', csv: '', warnings: ['No active pay run found'] };
+    }
+  
+ 
+    const {rows: metaRows} = await client.query(`
+      SELECT r.id as run_id, r.status,
+             pp.period_start, pp.period_end
+      FROM pay_runs r
+      JOIN pay_periods pp ON pp.id = r.period_id
+      WHERE r.id = $1
+      LIMIT 1
+    `, [activeRunId]);
+
+    const meta = metaRows[0];
+
+    if (!meta) {
+      return { filename: 'super-file.csv', csv: '', warnings: ['Pay run not found'] };
+    } 
+
+
+    const {rows}= await client.query(`
+      SELECT 
+        e.employee_id, e.first_name, e.last_name,
+        bank_pick.bsb,
+        bank_pick.account_number,
+        COALESCE(l.npf_employee,0) AS npf_employee,
+        COALESCE(l.npf_employer,0) AS npf_employer,
+        COALESCE(l.acc_employer,0) AS acc_employer
+      FROM pay_run_items l
+      JOIN employee e ON e.employee_id = l.employee_id
+      WHERE l.pay_run_id = $1
+      ORDER BY e.last_name, e.first_name, l.id
+    `, [activeRunId]);
+    
+    const columns = ['employee_id', 'first_name', 'last_name', 'bsb', 'account_number', 'npf_employee_cents', 'npf_employer_cents', 'acc_employer_cents', 'total_contribution_cents'];
+
+    const csvRows = rows.map(r => ({
+      employee_id: r.employee_id,
+      employee_name: `${r.first_name} ${r.last_name}`.trim() ,
+      period_start: meta.period_start,
+      period_end: meta.period_end,
+      gross: Number(r.gross).toFixed(2),
+      npf_employee: Number(r.npf_employee).toFixed(2),
+      npf_employer: Number(r.npf_employer).toFixed(2),
+      acc_employer: Number(r.acc_employer).toFixed(2),
+      total_contribution: (Number(r.npf_employee) + Number(r.npf_employer) + Number(r.acc_employer)).toFixed(2),
+    }));
+
+    const csv = toCsv({ columns, rows: csvRows });
+    return { filename: `super-run-${meta.run_id}.csv`, csv, warnings };
+  } finally {
+    client.release();
+  }
+}
+
 async function getRunMetaAndLinesForBank(client, runId) {
   // You may rename columns to match your schema if different.
   const metaQ = await client.query(`
@@ -1057,6 +1161,9 @@ async function getRunMetaAndLinesForPayslips(client, runId) {
       COALESCE(l.super,0)        as super,
       COALESCE(l.deductions_total,0) as deductions_total,
       COALESCE(l.net,0)          as net,
+      COALESCE(l.npf_employee,0)    as npf_employee,
+      COALESCE(l.npf_employer,0)    as npf_employer,
+      COALESCE(l.acc_employer,0)    as acc_employer,
       l.note
     FROM pay_run_items l
     JOIN employee e ON e.employee_id = l.employee_id
@@ -1272,7 +1379,7 @@ async function streamPayslipsPdfForRunById(runId, res) {
       return doc.y;
     }
 
-    function drawTotalsPanel(gross, tax, superEmployer, net) {
+    function drawTotalsPanel(gross, tax, superEmployer, accEmployer, net) {
       const h = 86;
       const y0 = doc.y + 10;
       doc.roundedRect(X_LEFT, y0, X_RIGHT - X_LEFT, h, 6).lineWidth(0.8).strokeColor(RULE_COLOR).stroke().strokeColor('black');
@@ -1284,11 +1391,13 @@ async function streamPayslipsPdfForRunById(runId, res) {
       doc.font('Helvetica-Bold').fontSize(11);
       doc.text('Gross', left, y0 + 10);
       doc.text('Tax', left, y0 + 30);
-      doc.text('Super (employer)', left, y0 + 50);
+      doc.text('NPF', left, y0 + 50);
+      doc.text('ACC', left, y0 + 80);
 
       doc.font('Helvetica-Bold').text(money(gross), mid, y0 + 10, { width: right - mid, align: 'right' });
       doc.font('Helvetica').text(money(tax), mid, y0 + 30, { width: right - mid, align: 'right' });
       doc.font('Helvetica').text(money(superEmployer), mid, y0 + 50, { width: right - mid, align: 'right' });
+      doc.font('Helvetica').text(money(accEmployer), mid, y0 + 50 + 30, { width: right - mid, align: 'right' });
 
       doc.font('Helvetica-Bold').fontSize(12).text('NET PAY', left, y0 + 68);
       doc.fontSize(14).text(money(net), mid, y0 + 66, { width: right - mid, align: 'right' });
@@ -1351,8 +1460,10 @@ async function streamPayslipsPdfForRunById(runId, res) {
       const allowance = num(r.allowance);
       const payeTax = num(r.tax);
       const otherDed = num(r.deductions_total);
-      const superEmployee = num(r.super_employee || 0);  // if you have it
-      const superEmployer = num(r.super_employer ?? r.super ?? 0); // fall back to r.super for now
+      const npfEmployee = num(r.npf_employee ?? r.super ?? 0); // employee NPF
+      const npfEmployer = num(r.npf_employer ?? 0);            // employer NPF
+      const accEmployer = num(r.acc_employer ?? 0);            // employer ACC
+      const npfEmployeeTotal = npfEmployee + npfEmployer;
 
       const base = hours * rate;
       if (hours > 0) yLeft = lineItem(`Base ${hours.toFixed(2)} h × ${money(rate)}`, base, COL_LEFT, yLeft);
@@ -1360,15 +1471,22 @@ async function streamPayslipsPdfForRunById(runId, res) {
       if (ot20h > 0) yLeft = lineItem(`Overtime 2.0   ${ot20h.toFixed(2)} h × ${money(rate)} × 2.0`, ot20h * rate * 2.0, COL_LEFT, yLeft);
       if (allowance > 0) yLeft = lineItem('Allowance', allowance, COL_LEFT, yLeft);
 
-      yRight = lineItem('Tax (PAYG)', payeTax, COL_RIGHT, yRight);
-      if (otherDed > 0) yRight = lineItem('Other deductions', otherDed, COL_RIGHT, yRight);
-      if (superEmployee > 0) yRight = lineItem('Super (employee-paid)', superEmployee, COL_RIGHT, yRight);
+      yRight = lineItem('Tax (PAYE)', payeTax, COL_RIGHT, yRight);
+
+      if (npfEmployeeTotal > 0) {
+        yRight = lineItem('NPF (employee, 10%)', npfEmployeeTotal, COL_RIGHT, yRight);
+      }
+
+      if (otherDed > 0) {
+        yRight = lineItem('Other deductions', otherDed, COL_RIGHT, yRight);
+      }
+
 
       // Totals panel (ensure space first)
       doc.y = ensureSpace(Math.max(yLeft, yRight) + 6, 100);
       const gross = num(r.gross);
       const net = num(r.net);
-      drawTotalsPanel(gross, payeTax, superEmployer, net);
+      drawTotalsPanel(gross, payeTax, npfEmployeeTotal, accEmployer, net);
 
       // Optional YTD block
       if (r.ytd) {
@@ -1419,7 +1537,7 @@ async function streamPayslipsPdfForRunById(runId, res) {
 
 
 function drawPayslipInLine(doc, data) {
- 
+
   const { run, employee, item } = data;
 
   const LOGO_PATH = process.env.COMPANY_LOGO_PATH || '';
@@ -1668,7 +1786,11 @@ function drawPayslipInLine(doc, data) {
   const allowance = num(item.allowance);
   const payeTax = num(item.tax);
   const otherDed = num(item.deductions_total || item.deductions);
-  const superEmployer = num(item.super_employer ?? item.super ?? 0);
+  const npfEmployee = num(item.npf_employee ?? item.super ?? 0);
+  const npfEmployer = num(item.npf_employer ?? 0);
+  const accEmployer = num(item.acc_employer ?? 0);
+
+  npfTotal = npfEmployee + npfEmployer;
 
   const base = hours * rate;
   if (hours > 0) {
@@ -1695,6 +1817,9 @@ function drawPayslipInLine(doc, data) {
   }
 
   yRight = lineItem('Tax (PAYG)', payeTax, COL_RIGHT, yRight);
+  if(npfTotal > 0 ) {
+    yRight = lineItem('NPF (employee, 10%', npfEmployee, COL_RIGHT, yRight);
+  }
   if (otherDed > 0) {
     yRight = lineItem('Other deductions', otherDed, COL_RIGHT, yRight);
   }
@@ -1703,7 +1828,7 @@ function drawPayslipInLine(doc, data) {
   doc.y = ensureSpace(Math.max(yLeft, yRight) + 6, 100);
   const gross = num(item.gross);
   const net = num(item.net);
-  drawTotalsPanel(gross, payeTax, superEmployer, net);
+  drawTotalsPanel(gross, payeTax, npfTotal, net);
 
   // Optional Note
   if (item.note) {
@@ -1823,9 +1948,363 @@ function splitUsableAndWarnings(lines) {
   return { usable, warnings };
 }
 
+async function importTimesheetsFromCsv(runId, fileBuffer) {
+  // --- 1. Parse CSV ---
+  let records;
+  try {
+    records = parse(fileBuffer, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+    });
+  } catch (e) {
+    throw new Error(`Failed to parse CSV: ${e.message}`);
+  }
 
+  if (!Array.isArray(records) || !records.length) {
+    throw new Error('CSV appears to be empty or invalid');
+  }
 
-// ---- final exports (no stub overwrite)
+  // Validate columns
+  const REQUIRED_COLS = [
+    'employee_number',
+    'regular_hours',
+    'ot_15_hours',
+    'ot_20_hours',
+    'allowances',
+    'deductions',
+    'notes',
+  ];
+  const headerCols = Object.keys(records[0] || {});
+  const missing = REQUIRED_COLS.filter(c => !headerCols.includes(c));
+  if (missing.length) {
+    throw new Error(`CSV missing required columns: ${missing.join(', ')}`);
+  }
+
+  // Optional: guard row count
+  const MAX_ROWS = 10000;
+  if (records.length > MAX_ROWS) {
+    throw new Error(`CSV has too many rows (${records.length}). Max allowed is ${MAX_ROWS}.`);
+  }
+
+  const client = await pool.connect();
+  let inserted = 0;
+  let updated = 0;
+  const errors = [];
+
+  try {
+    await client.query('BEGIN');
+
+    // --- 2. Validate pay run ---
+    const { rows: runRows } = await client.query(
+      `SELECT id, status FROM pay_runs WHERE id = $1`,
+      [runId]
+    );
+    if (!runRows.length) {
+      throw new Error(`Pay run not found with id ${runId}`);
+    }
+
+    // --- 3. Employee lookup ---
+    const allEmployeeNumbers = Array.from(
+      new Set(
+        records
+          .map(r => String(r.employee_number || '').trim())
+          .filter(v => v.length)
+      )
+    );
+
+    let employeesMap = new Map();
+    if (allEmployeeNumbers.length) {
+      const { rows: empRows } = await client.query(
+        `
+        SELECT employee_id, employee_number, effective_hourly_rate
+          FROM employee
+         WHERE employee_number = ANY($1)
+        `,
+        [allEmployeeNumbers]
+      );
+      for (const row of empRows) {
+        employeesMap.set(String(row.employee_number), row);
+      }
+    }
+
+    // --- 4. Process each record ---
+    for (let i = 0; i < records.length; i++) {
+      const row = records[i];
+      const rowNumber = i + 2;
+
+      try {
+        const employeeNumber = String(row.employee_number || '').trim();
+        if (!employeeNumber) {
+          errors.push({ row: rowNumber, error: 'Missing employee_number' });
+          continue;
+        }
+
+        const emp = employeesMap.get(employeeNumber);
+        if (!emp) {
+          errors.push({
+            row: rowNumber,
+            error: `Employee not found for employee_number=${employeeNumber}`,
+          });
+          continue;
+        }
+        const employeeId = emp.employee_id;
+
+        // Parse numeric fields
+        const regularHours = Number(row.regular_hours || 0);
+        const ot15Hours = Number(row.ot_15_hours || 0);
+        const ot20Hours = Number(row.ot_20_hours || 0);
+        const allowance = Number(row.allowances || 0);
+        const deductions = Number(row.deductions || 0);
+        const note = row.notes || null;
+
+        // Simple business validation
+        if (regularHours < 0 || ot15Hours < 0 || ot20Hours < 0) {
+          errors.push({
+            row: rowNumber,
+            error: 'Hours cannot be negative',
+          });
+          continue;
+        }
+
+        if (allowance < 0 || deductions < 0) {
+          errors.push({
+            row: rowNumber,
+            error: 'Allowance/deductions cannot be negative',
+          });
+          continue;
+        }
+
+        const rate = Number(emp.effective_hourly_rate || 0);
+
+        let taxRate = Number(emp.tax_rate || 0);
+        if (taxRate > 1) {
+          taxRate = taxRate / 100; // interpret as percentage
+        }
+
+        const baseHours = isNaN(hours) ? 0 : hours;
+        const baseOt15 = isNaN(ot15Hours) ? 0 : ot15Hours;
+        const baseOt20 = isNaN(ot20Hours) ? 0 : ot20Hours;
+        const baseAllowance = isNaN(allowance) ? 0 : allowance;
+        const baseDeductions = isNaN(deductions) ? 0 : deductions;
+
+        const grossFromHours =
+          rate * baseHours +
+          rate * baseOt15 * 1.5 +
+          rate * baseOt20 * 2.0;
+
+        const gross = grossFromHours + baseAllowance;
+        const tax = gross * taxRate;
+        const superAmount = grossFromHours * SUPER_RATE;
+        const net = gross - tax - baseDeductions;
+
+        // Ensure non-negative for your chk_pay_run_items_nonneg
+        const safeGross = Math.max(0, round2(gross));
+        const safeTax = Math.max(0, round2(tax));
+        const safeDeductions = Math.max(0, round2(baseDeductions));
+        const safeNet = Math.max(0, round2(net));
+        const safeRate = Math.max(0, round2(rate));
+        const safeHours = Math.max(0, round2(baseHours));
+        const safeAllowance = Math.max(0, round2(baseAllowance));
+        const safeSuper = Math.max(0, round2(superAmount));
+        const safeOt15 = Math.max(0, round2(baseOt15));
+        const safeOt20 = Math.max(0, round2(baseOt20));
+
+        const { rows: upsertRows } = await client.query(
+          `
+           INSERT INTO pay_run_items (
+            pay_run_id,
+            employee_id,
+            gross,
+            tax,
+            deductions_total,
+            net,
+            rate,
+            hours,
+            allowance,
+            super,
+            status,
+            note,
+            ot_15_hours,
+            ot_20_hours
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Draft',$11,$12,$13)
+          ON CONFLICT (pay_run_id, employee_id)
+          DO UPDATE SET
+            gross            = EXCLUDED.gross,
+            tax              = EXCLUDED.tax,
+            deductions_total = EXCLUDED.deductions_total,
+            net              = EXCLUDED.net,
+            rate             = EXCLUDED.rate,
+            hours            = EXCLUDED.hours,
+            allowance        = EXCLUDED.allowance,
+            super            = EXCLUDED.super,
+            status           = EXCLUDED.status,
+            note             = EXCLUDED.note,
+            ot_15_hours      = EXCLUDED.ot_15_hours,
+            ot_20_hours      = EXCLUDED.ot_20_hours
+          RETURNING xmax = 0 AS inserted;
+          `,
+          [
+            runId,
+            employeeId,
+            safeGross,
+            safeTax,
+            safeDeductions,
+            safeNet,
+            safeRate,
+            safeHours,
+            safeAllowance,
+            safeSuper,
+            note,
+            safeOt15,
+            safeOt20,
+          ]
+        );
+
+        if (upsertRows[0].inserted) inserted++;
+        else updated++;
+      } catch (rowErr) {
+        console.error('[importTimesheets] row error', rowErr);
+        errors.push({ row: rowNumber, error: rowErr.message });
+        continue;
+      }
+    }
+
+    // --- 5. Recalculate totals (reuse your existing helper if you have one) ---
+    await recalculateRunTotals(client, runId);
+
+    await client.query('COMMIT');
+
+    return {
+      run_id: runId,
+      records: records.length,
+      inserted,
+      updated,
+      error_count: errors.length,
+      errors,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function recalculateRunTotals(client, runId) {
+  await client.query(
+    `
+    UPDATE pay_runs r
+       SET totals_employees = sub.cnt,
+           totals_gross     = sub.total_gross,
+           totals_net       = sub.total_net,
+           updated_at       = NOW()
+      FROM (
+        SELECT
+          run_id,
+          COUNT(*)                        AS cnt,
+          COALESCE(SUM(gross_amount), 0)  AS total_gross,
+          COALESCE(SUM(net_amount), 0)    AS total_net
+        FROM pay_run_items
+        WHERE pay_run_id = $1
+        GROUP BY pay_run_id
+      ) sub
+     WHERE r.id = sub.run_id
+       AND r.id = $1;
+    `,
+    [runId]
+  );
+}
+
+function round2(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function calculateSamoaTaxForPeriod(grossForPeriod, payCycle) {
+  const cyclesPerYear = {
+    WEEKLY: 52,
+    FORTNIGHTLY: 26,
+    FORTNIGHT: 26,
+    MONTHLY: 12,
+    ANNUAL: 1,
+  };
+
+  const periods = cyclesPerYear[payCycle] || 52;
+  const annualIncome = grossForPeriod * periods;
+
+  let annualTax = 0;
+
+  if (annualIncome > 25000) {
+    annualTax =
+      (annualIncome - 25000) * 0.27 +
+      (25000 - 15000) * 0.20;
+  } else if (annualIncome > 15000) {
+    annualTax = (annualIncome - 15000) * 0.20;
+  } else {
+    annualTax = 0;
+  }
+
+  return annualTax / periods;
+}
+
+async function getSamoaContributionsSummary(runId) {
+  const client = await pool.connect();
+  try {
+    const id = runId ?? (await getActiveRunId(client));
+    if (!id) {
+      return { ok: false, message: 'No active run', employees: [], totals: {} };
+    }
+
+    const { rows } = await client.query(
+      `
+      SELECT 
+        e.employee_id,
+        e.first_name,
+        e.last_name,
+        COALESCE(l.gross,0)         AS gross,
+        COALESCE(l.tax,0)           AS tax,
+        COALESCE(l.npf_employee,0)  AS npf_employee,
+        COALESCE(l.npf_employer,0)  AS npf_employer,
+        COALESCE(l.acc_employer,0)  AS acc_employer,
+        COALESCE(l.net,0)           AS net
+      FROM pay_run_items l
+      JOIN employee e ON e.employee_id = l.employee_id
+      WHERE l.pay_run_id = $1
+      ORDER BY e.last_name, e.first_name, l.id
+      `,
+      [id]
+    );
+
+    const employees = rows.map(r => ({
+      employee_id: r.employee_id,
+      name: `${r.first_name} ${r.last_name}`,
+      gross: Number(r.gross),
+      tax: Number(r.tax),
+      npf_employee: Number(r.npf_employee),
+      npf_employer: Number(r.npf_employer),
+      acc_employer: Number(r.acc_employer),
+      net: Number(r.net),
+    }));
+
+    const totals = employees.reduce(
+      (t, e) => ({
+        gross: t.gross + e.gross,
+        tax: t.tax + e.tax,
+        npf_employee: t.npf_employee + e.npf_employee,
+        npf_employer: t.npf_employer + e.npf_employer,
+        acc_employer: t.acc_employer + e.acc_employer,
+        net: t.net + e.net,
+      }),
+      { gross: 0, tax: 0, npf_employee: 0, npf_employer: 0, acc_employer: 0, net: 0 }
+    );
+
+    return { ok: true, run_id: id, employees, totals };
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   viewPayslipInline,
   getActiveRunId,
@@ -1844,7 +2323,9 @@ module.exports = {
   addCurrentRunItem,
   deleteCurrentItem,
   buildBankCsvForCurrentRun,
+  buildSuperCsvForCurrentRun,
   streamPayslipsPdfForCurrentRun,
   streamPayslipsPdfForRunById,
-
+  importTimesheetsFromCsv,
+  getSamoaContributionsSummary
 };

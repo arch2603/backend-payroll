@@ -1,6 +1,7 @@
 // controllers/userController.js
 const pool = require('../db');
 const bcrypt = require('bcrypt');
+const userService = require('../service/userService')
 
 /**
  * GET /users
@@ -41,21 +42,13 @@ const createUser = async (req, res) => {
 };
 
 const updateUser = async (req, res) => {
-  const id = Number(req.params.id);
-  const { username, role, employee_id } = req.body;
-
   try {
-    const updateQ = await pool.query(
-      `UPDATE users
-      SET username = COALESCE($1, username),
-      role = COALESCE($2, role),
-      employee_id = COALESCE($3, employee_id)
-      WHERE user_id = $4
-      RETURNING user_id, username, role, employee_id, created_at`,
-      [username ?? null, role ?? null, employee_id ?? null, id]
-    );
-    if (updateQ.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-    res.json(updateQ.rows[0]);
+    const userId = Number(req.params.userId);
+    const payload = req.body;
+
+    if (!Number.isFinite(userId)) return res.status(400).json({ message: 'Invalid user id' });
+    const updated = await userService.updateUserService(userId, payload);
+    return res.json(updated);
   } catch (err) {
     console.error('updateUser error', err);
     res.status(500).json({ message: 'Error updating user' });

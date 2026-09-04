@@ -3,12 +3,10 @@ const router = express.Router();
 const { authenticateToken, authorizeRoles } = require('../middleware/authMiddleware');
 const payRunCtrl = require('../controllers/payRunController');
 
-console.log('[payRunRoutes] typeof authenticateToken =', typeof authenticateToken);
-console.log('[payRunRoutes] typeof payRunCtrl =', typeof payRunCtrl);
-['getCurrentSummary','getCurrentItems','getCurrent','startCurrent','recalculateCurrent','approveCurrent','postCurrent'].forEach(fn => {
-  console.log(`[payRunRoutes] typeof ${fn} =`, typeof payRunCtrl?.[fn]);
-})
-router.get('/__debug/current/summary', payRunCtrl.getCurrentSummary);
+
+// ['getCurrentSummary','getCurrentItems','getCurrent','startCurrent','recalculateCurrent','approveCurrent','postCurrent'].forEach(fn => {
+//   console.log(`[payRunRoutes] typeof ${fn} =`, typeof payRunCtrl?.[fn]);
+// })
 
 router.get('/current', authenticateToken, payRunCtrl.getCurrent);
 router.get('/current/summary', authenticateToken, payRunCtrl.getCurrentSummary);
@@ -65,6 +63,20 @@ router.delete(
   payRunCtrl.deleteCurrentItem
 );
 
-router.get('/ping', (req, res) => res.json({ ok: true, where: 'pay-runs' }));
+router.get(
+  '/current/samoa-summary',
+  authenticateToken,
+  authorizeRoles('admin', 'hr'),
+  payRunCtrl.getCurrentSamoaSummary
+);
+
+router.get(
+  '/:runId/samoa-summary',
+  authenticateToken,
+  authorizeRoles('admin', 'hr'),
+  payRunCtrl.getSamoaSummaryByRunId
+);
+
+router.get('/current/export/super-file', authenticateToken, authorizeRoles('admin','hr'), payRunCtrl.exportSuperFile);
 
 module.exports = router;
